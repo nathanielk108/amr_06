@@ -12,11 +12,10 @@
 #include <rclcpp/utilities.hpp>
 
 #include <geometry_msgs/msg/twist.hpp>
-#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rmw/qos_profiles.h>
-#include <sensor_msgs/msg/laser_scan.hpp>
 #include <sensor_msgs/msg/joy.hpp>
+#include <irobot_create_msgs/msg/ir_intensity.hpp>
 
 using namespace std::chrono_literals;
 using namespace std::placeholders;
@@ -68,11 +67,10 @@ private:
   rclcpp::Subscription<Joy>::SharedPtr sub_joy_;
 
   // TODO: Process Laser range and odometry
-  // rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
   // rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
 
-  TwistStamped twist_cmd;
-  rclcpp::Publisher<TwistStamped>::SharedPtr pub_twist_;
+  Twist twist_cmd;
+  rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
 
   // TODO: Random angle target generation
   std::mt19937 mt;
@@ -109,7 +107,7 @@ public:
     //   std::bind(&TTBControlNode::odometry_callback, this, _1)
     // );
 
-    pub_twist_ = this->create_publisher<TwistStamped>(
+    pub_twist_ = this->create_publisher<Twist>(
       "/TTB06/cmd_vel",
       10
     );
@@ -144,19 +142,11 @@ private:
 
   void joy_callback(const Joy &msg) {
     if (msg.buttons[JoyButtons::R1]) {
-      twist_cmd.twist.linear.set__x(msg.axes[JoyAxes::L_Y]);
-      twist_cmd.twist.angular.set__z(msg.axes[JoyAxes::L_X]);
+      twist_cmd.linear.set__x(msg.axes[JoyAxes::L_Y]);
+      twist_cmd.angular.set__z(msg.axes[JoyAxes::L_X]);
     }
   }
 
-  // void laser_scan_callback(const LaserScan &msg) {
-  //   if (current_mode != AUTO_WANDERING) return;
-  //   if (std::any_of(msg.ranges.begin(), msg.ranges.end(), [](float val) { return val < 0.1; })) {
-  //     twist_cmd = TwistStamped();
-  //     pub_twist_->publish(twist_cmd);
-  //     float new_angle = angle_dist(mt);
-  //   }
-  // }
   //
   // void odometry_callback(const Odometry &msg) {
   //   if (current_mode != CRUISE_CONTROL) return;

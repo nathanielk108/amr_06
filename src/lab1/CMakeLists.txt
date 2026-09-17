@@ -14,6 +14,7 @@ find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(irobot_create_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 
@@ -29,15 +30,10 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-add_executable(ttb_joy_teleop_node src/ttb_joy_telop_node.cpp)
-ament_target_dependencies(ttb_joy_teleop_node rclcpp sensor_msgs geometry_msgs)
-
 add_executable(ttb_control_node src/ttb_control_node.cpp)
-ament_target_dependencies(ttb_control_node rclcpp nav_msgs sensor_msgs geometry_msgs tf2 tf2_ros)
+ament_target_dependencies(ttb_control_node rclcpp nav_msgs sensor_msgs irobot_create_msgs geometry_msgs tf2 tf2_ros)
 
-install(TARGETS ttb_joy_teleop_node ttb_control_node
+install(TARGETS ttb_control_node
         DESTINATION lib/${PROJECT_NAME})
-install(DIRECTORY launch
-        DESTINATION share/${PROJECT_NAME})
 
 ament_package()
