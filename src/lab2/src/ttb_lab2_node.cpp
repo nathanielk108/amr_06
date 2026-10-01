@@ -85,6 +85,10 @@ private:
   std::mutex goal_mtx_;
   bool goal_active_;
 
+  double current_angle_;
+  Vector3 goal_pos_;
+  double goal_margin_;
+
 public:
   explicit TTBLab2Node() : rclcpp::Node("ttb_lab2_node") {
     timer_ = this->create_wall_timer(
@@ -133,6 +137,12 @@ private:
   void odometry_callback(const Odometry &msg) {
     pos_.x = msg.pose.pose.position.x;
     pos_.y = msg.pose.pose.position.y;
+
+    double qx = msg.pose.pose.orientation.x;
+    double qy = msg.pose.pose.orientation.y;
+    double qz = msg.pose.pose.orientation.z;
+    double qw = msg.pose.pose.orientation.w;
+    current_angle_ = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)); // quarternion yaw angle
   }
 
   rclcpp_action::GoalResponse handle_goal_go_to_goal(const rclcpp_action::GoalUUID &uuid, [[maybe_unused]] std::shared_ptr<const GoToGoal::Goal> goal) {
@@ -142,8 +152,13 @@ private:
       RCLCPP_INFO(this->get_logger(), "BUSY - Rejecting Action Request: %s", goal_name.c_str());
       return rclcpp_action::GoalResponse::REJECT;
     }
+
     goal_active_ = true;
-    RCLCPP_INFO(this->get_logger(), "FREE - Accepting Action Request: %s", goal_name.c_str());
+    goal_pos_.set__x(pos_.x + goal->position[0]);
+    goal_pos_.set__y(pos_.y + goal->position[1]);
+    goal_margin_ = goal->margin;
+
+    RCLCPP_INFO(this->get_logger(), "FREE - Accepting Action Request: %s - [%lf, %lf]", goal_name.c_str(), goal_pos_.x, goal_pos_.y);
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
@@ -161,14 +176,35 @@ private:
 
     std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
 
+    double Kv = 0.1;
+    double Kp = 0.1;
+    Twist gtg_twist;
+
     rclcpp::WallRate rate(10); // 10 Hz loop
     while (rclcpp::ok()) {
       if (handle->is_canceling()) {
         break;
       }
 
-      // Goal Logic Here
-      RCLCPP_INFO(this->get_logger(), "%s Action Running", goal_name.c_str());
+      double distance = std::sqrt((goal_pos_.x - pos_.x)*(goal_pos_.x - pos_.x) + (goal_pos_.y - pos_.y)*(goal_pos_.y - pos_.y));
+      double abs_distance = std::abs(distance);
+      if (abs_distance < goal_margin_) {
+        break;
+      }
+
+      double velocity = Kv * distance;
+      double theta = std::atan2(goal_pos_.y - pos_.y, goal_pos_.x - pos_.x);
+      double angle_error = theta - current_angle_;
+      double gamma = Kp * (std::atan2(std::sin(angle_error), std::cos(angle_error)));
+
+      gtg_twist.linear.set__x(velocity);
+      gtg_twist.angular.set__z(gamma);
+      pub_twist_->publish(gtg_twist);
+
+      feedback->set__veloctity(velocity);
+      feedback->set__gamma(gamma);
+      feedback->set__distance(std::abs(distance));
+      handle->publish_feedback(feedback);
 
       rate.sleep();
     }
@@ -182,6 +218,7 @@ private:
       RCLCPP_INFO(this->get_logger(), "%s Action Succeeded", goal_name.c_str());
       handle->succeed(result);
     }
+
     std::lock_guard<std::mutex> lock(goal_mtx_);
     goal_active_ = false;
   }
