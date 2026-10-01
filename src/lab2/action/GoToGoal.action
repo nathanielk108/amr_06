@@ -1,6 +1,11 @@
-float32[] destination
+float32[] position
+float32 margin
+float32 kv
+float32 kp
 bool pid
 ---
 float32[] position
 ---
 float32 distance
+float32 velocity
+float32 gamma

@@ -125,7 +125,7 @@ public:
 
 private:
   void command_loop_function() {
-    pub_twist_->publish(joy_cmd_);
+    // pub_twist_->publish(joy_cmd_);
     return;
   }
 
@@ -194,14 +194,13 @@ private:
 
       double velocity = Kv * distance;
       double theta = std::atan2(goal_pos_.y - pos_.y, goal_pos_.x - pos_.x);
-      double angle_error = theta - current_angle_;
-      double gamma = Kp * (std::atan2(std::sin(angle_error), std::cos(angle_error)));
+      double gamma = Kp * (std::atan2(std::sin(theta), std::cos(theta)));
 
       gtg_twist.linear.set__x(velocity);
       gtg_twist.angular.set__z(gamma);
       pub_twist_->publish(gtg_twist);
 
-      feedback->set__veloctity(velocity);
+      feedback->set__velocity(velocity);
       feedback->set__gamma(gamma);
       feedback->set__distance(std::abs(distance));
       handle->publish_feedback(feedback);
