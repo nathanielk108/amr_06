@@ -55,12 +55,8 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 
   rclcpp::Subscription<Joy>::SharedPtr sub_joy_;
-
-  // TODO: Process odometry
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
-
-  rclcpp::Subscription<irobot_create_msgs::msg::IrIntensityVector>::SharedPtr
-      sub_ir_;
+  rclcpp::Subscription<irobot_create_msgs::msg::IrIntensityVector>::SharedPtr sub_ir_;
 
   Twist twist_cmd;
   rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
