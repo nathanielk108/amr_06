@@ -86,8 +86,6 @@ private:
   bool goal_active_;
 
   double current_angle_;
-  Vector3 goal_pos_;
-  double goal_margin_;
 
 public:
   explicit TTBLab2Node() : rclcpp::Node("ttb_lab2_node") {
@@ -145,7 +143,7 @@ private:
     current_angle_ = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)); // quarternion yaw angle
   }
 
-  rclcpp_action::GoalResponse handle_goal_go_to_goal(const rclcpp_action::GoalUUID &uuid, [[maybe_unused]] std::shared_ptr<const GoToGoal::Goal> goal) {
+  rclcpp_action::GoalResponse handle_goal_go_to_goal(const rclcpp_action::GoalUUID &uuid, std::shared_ptr<const GoToGoal::Goal> goal) {
     std::string goal_name {rclcpp_action::to_string(uuid)};
     std::lock_guard<std::mutex> lock(goal_mtx_); // Locks mutex until end of scope
     if (goal_active_) {
@@ -154,11 +152,7 @@ private:
     }
 
     goal_active_ = true;
-    goal_pos_.set__x(pos_.x + goal->position[0]);
-    goal_pos_.set__y(pos_.y + goal->position[1]);
-    goal_margin_ = goal->margin;
-
-    RCLCPP_INFO(this->get_logger(), "FREE - Accepting Action Request: %s - [%lf, %lf]", goal_name.c_str(), goal_pos_.x, goal_pos_.y);
+    RCLCPP_INFO(this->get_logger(), "FREE - Accepting Action Request: %s - [%lf, %lf]", goal_name.c_str(), goal->position[0], goal->position[1]);
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
@@ -167,17 +161,23 @@ private:
   }
 
   void handle_accepted_go_to_goal(const std::shared_ptr<GoToGoalHandle> handle) {
+    auto goal = handle->get_goal();
     std::thread{std::bind(&TTBLab2Node::execute_go_to_goal, this, _1), handle}.detach();
   }
 
   void execute_go_to_goal(const std::shared_ptr<GoToGoalHandle> handle) {
+    std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
+    auto goal = handle->get_goal();
+
     auto feedback = std::make_shared<GoToGoal::Feedback>();
     auto result = std::make_shared<GoToGoal::Result>();
 
-    std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
+    double goal_pos_x = goal->position[0];
+    double goal_pos_y = goal->position[1];
+    double kv = goal->kv;
+    double kp = goal->kp;
+    double margin = goal->margin;
 
-    double Kv = 0.1;
-    double Kp = 0.1;
     Twist gtg_twist;
 
     rclcpp::WallRate rate(10); // 10 Hz loop
@@ -186,15 +186,15 @@ private:
         break;
       }
 
-      double distance = std::sqrt((goal_pos_.x - pos_.x)*(goal_pos_.x - pos_.x) + (goal_pos_.y - pos_.y)*(goal_pos_.y - pos_.y));
+      double distance = std::sqrt((goal_pos_x - pos_.x)*(goal_pos_x - pos_.x) + (goal_pos_y - pos_.y)*(goal_pos_y - pos_.y));
       double abs_distance = std::abs(distance);
-      if (abs_distance < goal_margin_) {
+      if (abs_distance < margin) {
         break;
       }
 
-      double velocity = Kv * distance;
-      double theta = std::atan2(goal_pos_.y - pos_.y, goal_pos_.x - pos_.x);
-      double gamma = Kp * (std::atan2(std::sin(theta), std::cos(theta)));
+      double velocity = kv * distance;
+      double theta = std::atan2(goal_pos_y - pos_.y, goal_pos_x - pos_.x);
+      double gamma = kp * (std::atan2(std::sin(theta), std::cos(theta)));
 
       gtg_twist.linear.set__x(velocity);
       gtg_twist.angular.set__z(gamma);
