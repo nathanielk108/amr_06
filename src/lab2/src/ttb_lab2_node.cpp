@@ -123,7 +123,6 @@ public:
 
 private:
   void command_loop_function() {
-    // pub_twist_->publish(joy_cmd_);
     return;
   }
 
@@ -133,9 +132,11 @@ private:
   }
 
   void odometry_callback(const Odometry &msg) {
+    // Global Frame
     pos_.x = msg.pose.pose.position.x;
     pos_.y = msg.pose.pose.position.y;
 
+    // Robot Frame
     double qx = msg.pose.pose.orientation.x;
     double qy = msg.pose.pose.orientation.y;
     double qz = msg.pose.pose.orientation.z;
@@ -172,11 +173,13 @@ private:
     auto feedback = std::make_shared<GoToGoal::Feedback>();
     auto result = std::make_shared<GoToGoal::Result>();
 
-    double goal_pos_x = goal->position[0];
-    double goal_pos_y = goal->position[1];
+    double goal_pos_x = pos_.x + (goal->position[0] * std::cos(current_angle_)) - (goal->position[1] * std::sin(current_angle_));
+    double goal_pos_y = pos_.y + (goal->position[0] * std::sin(current_angle_)) + (goal->position[1] * std::cos(current_angle_));
     double kv = goal->kv;
     double kp = goal->kp;
     double margin = goal->margin;
+
+    RCLCPP_INFO(this->get_logger(), "GOAL: %f, %f", goal_pos_x, goal_pos_y);
 
     Twist gtg_twist;
 
@@ -194,7 +197,7 @@ private:
 
       double velocity = kv * distance;
       double theta = std::atan2(goal_pos_y - pos_.y, goal_pos_x - pos_.x);
-      double gamma = kp * (std::atan2(std::sin(theta), std::cos(theta)));
+      double gamma = kp * theta;
 
       gtg_twist.linear.set__x(velocity);
       gtg_twist.angular.set__z(gamma);
@@ -202,7 +205,7 @@ private:
 
       feedback->set__velocity(velocity);
       feedback->set__gamma(gamma);
-      feedback->set__distance(std::abs(distance));
+      feedback->set__distance(distance);
       handle->publish_feedback(feedback);
 
       rate.sleep();
