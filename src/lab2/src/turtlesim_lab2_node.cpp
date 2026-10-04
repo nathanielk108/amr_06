@@ -17,21 +17,21 @@
 #include <lab2/action/go_to_goal.hpp>
 
 #include <geometry_msgs/msg/twist.hpp>
-#include <irobot_create_msgs/msg/ir_intensity_vector.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp_action/server.hpp>
 #include <rmw/qos_profiles.h>
 #include <sensor_msgs/msg/joy.hpp>
+#include <turtlesim/msg/pose.hpp>
 
 using namespace std::chrono_literals;
 using namespace std::placeholders;
 
 using namespace sensor_msgs::msg;
 using namespace geometry_msgs::msg;
+using namespace turtlesim::msg;
 using namespace nav_msgs::msg;
-using namespace irobot_create_msgs::msg;
 
-class TTBLab2Node : public rclcpp::Node {
+class TurtlesimLab2Node : public rclcpp::Node {
 
   using GoToGoal = lab2::action::GoToGoal;
   using GoToGoalHandle = rclcpp_action::ServerGoalHandle<GoToGoal>;
@@ -66,8 +66,7 @@ private:
 
   // Subscriptions
   rclcpp::Subscription<Joy>::SharedPtr sub_joy_;
-  rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
-  rclcpp::Subscription<irobot_create_msgs::msg::IrIntensityVector>::SharedPtr sub_ir_;
+  rclcpp::Subscription<turtlesim::msg::Pose>::SharedPtr sub_pose_;
 
   // Publishers
   rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
@@ -88,33 +87,33 @@ private:
   double current_angle_;
 
 public:
-  explicit TTBLab2Node() : rclcpp::Node("ttb_lab2_node") {
+  explicit TurtlesimLab2Node() : rclcpp::Node("turtlesim_lab2_node") {
     timer_ = this->create_wall_timer(
-        100ms, std::bind(&TTBLab2Node::command_loop_function, this));
+        100ms, std::bind(&TurtlesimLab2Node::command_loop_function, this));
 
     sub_joy_ = this->create_subscription<Joy>(
-        "/TTB06/joy",
+        "/turtle1/joy",
         rclcpp::QoS(
             rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
             rmw_qos_profile_sensor_data),
-        std::bind(&TTBLab2Node::joy_callback, this, _1));
+        std::bind(&TurtlesimLab2Node::joy_callback, this, _1));
 
-    sub_odometry_ = this->create_subscription<Odometry>(
-        "/TTB06/odom",
+    sub_pose_ = this->create_subscription<turtlesim::msg::Pose>(
+        "/turtle1/pose",
         rclcpp::QoS(
             rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
             rmw_qos_profile_sensor_data),
-        std::bind(&TTBLab2Node::odometry_callback, this, _1));
+        std::bind(&TurtlesimLab2Node::pose_callback, this, _1));
 
     serv_go_to_goal_ = rclcpp_action::create_server<GoToGoal>(
       this,
-      "/TTB06/go_to_goal",
-      std::bind(&TTBLab2Node::handle_goal_go_to_goal, this, _1, _2),
-      std::bind(&TTBLab2Node::handle_cancel_go_to_goal, this, _1),
-      std::bind(&TTBLab2Node::handle_accepted_go_to_goal, this, _1)
+      "/turtle1/go_to_goal",
+      std::bind(&TurtlesimLab2Node::handle_goal_go_to_goal, this, _1, _2),
+      std::bind(&TurtlesimLab2Node::handle_cancel_go_to_goal, this, _1),
+      std::bind(&TurtlesimLab2Node::handle_accepted_go_to_goal, this, _1)
     );
 
-    pub_twist_ = this->create_publisher<Twist>("/TTB06/cmd_vel", 10);
+    pub_twist_ = this->create_publisher<Twist>("/turtle1/cmd_vel", 10);
 
     pos_.x = 0;
     pos_.y = 0;
@@ -131,17 +130,13 @@ private:
     joy_cmd_.angular.z = msg.axes[L_X];
   }
 
-  void odometry_callback(const Odometry &msg) {
+  void pose_callback(const turtlesim::msg::Pose &msg) {
     // Global Frame
-    pos_.x = msg.pose.pose.position.x;
-    pos_.y = msg.pose.pose.position.y;
+    pos_.x = msg.x;
+    pos_.y = msg.y;
 
     // Robot Frame
-    double qx = msg.pose.pose.orientation.x;
-    double qy = msg.pose.pose.orientation.y;
-    double qz = msg.pose.pose.orientation.z;
-    double qw = msg.pose.pose.orientation.w;
-    current_angle_ = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)); // quarternion yaw angle
+    current_angle_ = msg.theta;
   }
 
   rclcpp_action::GoalResponse handle_goal_go_to_goal(const rclcpp_action::GoalUUID &uuid, std::shared_ptr<const GoToGoal::Goal> goal) {
@@ -163,7 +158,7 @@ private:
 
   void handle_accepted_go_to_goal(const std::shared_ptr<GoToGoalHandle> handle) {
     auto goal = handle->get_goal();
-    std::thread{std::bind(&TTBLab2Node::execute_go_to_goal, this, _1), handle}.detach();
+    std::thread{std::bind(&TurtlesimLab2Node::execute_go_to_goal, this, _1), handle}.detach();
   }
 
   void execute_go_to_goal(const std::shared_ptr<GoToGoalHandle> handle) {
@@ -190,14 +185,15 @@ private:
       }
 
       double distance = std::sqrt((goal_pos_x - pos_.x)*(goal_pos_x - pos_.x) + (goal_pos_y - pos_.y)*(goal_pos_y - pos_.y));
-      double abs_distance = std::abs(distance);
-      if (abs_distance < margin) {
+      if (distance < margin) {
         break;
       }
 
+      RCLCPP_INFO(this->get_logger(), "POS: %f, %f, %f", pos_.x, pos_.y, current_angle_);
+
       double velocity = kv * distance;
       double desiredHeading = std::atan2(goal_pos_y - pos_.y, goal_pos_x - pos_.x);
-      double headingError = std::atan2(std::sin(desiredHeading - current_angle_), std::cos(desiredHeading - current_angle_));
+      double headingError = std::atan2(sin(desiredHeading - current_angle_), cos(desiredHeading - current_angle_));
       double steering = kp * headingError;
 
       gtg_twist.linear.set__x(velocity);
@@ -230,7 +226,7 @@ private:
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
 
-  TTBLab2Node::SharedPtr control_node = std::make_shared<TTBLab2Node>();
+  TurtlesimLab2Node::SharedPtr control_node = std::make_shared<TurtlesimLab2Node>();
   rclcpp::executors::SingleThreadedExecutor exec{};
   exec.add_node(control_node);
   exec.spin();

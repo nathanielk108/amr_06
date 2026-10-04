@@ -14,7 +14,9 @@ find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+
 find_package(irobot_create_msgs REQUIRED)
+find_package(turtlesim REQUIRED)
 
 find_package(rclcpp_action REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
@@ -38,14 +40,17 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(ttb_lab2_node src/ttb_lab2_node)
+add_executable(turtlesim_lab2_node src/turtlesim_lab2_node)
+ament_target_dependencies(turtlesim_lab2_node rclcpp rclcpp_action nav_msgs geometry_msgs sensor_msgs turtlesim)
 ament_target_dependencies(ttb_lab2_node rclcpp rclcpp_action nav_msgs geometry_msgs sensor_msgs irobot_create_msgs)
 
 rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 target_link_libraries(ttb_lab2_node "${cpp_typesupport_target}")
+target_link_libraries(turtlesim_lab2_node "${cpp_typesupport_target}")
 
-install(TARGETS ttb_lab2_node
+install(TARGETS ttb_lab2_node turtlesim_lab2_node
         DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

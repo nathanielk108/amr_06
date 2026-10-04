@@ -12,9 +12,11 @@
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
-  <depend>irobot_create_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
+
+  <depend>irobot_create_msgs</depend>
+  <depend>turtlesim</depend>
 
   <depend>rclcpp_action</depend>
   <depend>rosidl_default_generators</depend>

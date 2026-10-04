@@ -8,4 +8,4 @@ float32[] position
 ---
 float32 distance
 float32 velocity
-float32 gamma
+float32 steering
