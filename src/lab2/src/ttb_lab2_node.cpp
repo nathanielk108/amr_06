@@ -190,8 +190,7 @@ private:
       }
 
       double distance = std::sqrt((goal_pos_x - pos_.x)*(goal_pos_x - pos_.x) + (goal_pos_y - pos_.y)*(goal_pos_y - pos_.y));
-      double abs_distance = std::abs(distance);
-      if (abs_distance < margin) {
+      if (distance < margin) {
         break;
       }
 
