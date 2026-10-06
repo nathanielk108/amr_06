@@ -144,7 +144,7 @@ private:
     current_angle_ = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)); // quarternion yaw angle
   }
 
-  rclcpp_action::GoalResponse handle_goal_go_to_goal(const rclcpp_action::GoalUUID &uuid, std::shared_ptr<const GoToGoal::Goal> goal) {
+  rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID &uuid) {
     std::string goal_name {rclcpp_action::to_string(uuid)};
     std::lock_guard<std::mutex> lock(goal_mtx_); // Locks mutex until end of scope
     if (goal_active_) {
@@ -153,8 +153,12 @@ private:
     }
 
     goal_active_ = true;
-    RCLCPP_INFO(this->get_logger(), "FREE - Accepting Action Request: %s - [%lf, %lf]", goal_name.c_str(), goal->position[0], goal->position[1]);
+    RCLCPP_INFO(this->get_logger(), "FREE - Accepting Action Request: %s", goal_name.c_str());
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+  }
+
+  rclcpp_action::GoalResponse handle_goal_go_to_goal(const rclcpp_action::GoalUUID &uuid, [[maybe_unused]] std::shared_ptr<const GoToGoal::Goal> goal) {
+    return handle_goal(uuid);
   }
 
   rclcpp_action::CancelResponse handle_cancel_go_to_goal([[maybe_unused]] const std::shared_ptr<GoToGoalHandle> handle) {
