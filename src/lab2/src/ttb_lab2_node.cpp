@@ -241,11 +241,11 @@ rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const s
 
       double velocity = 0;
       if (pid) {
-        double dt = rate.period().count();
+        double dt = 0.1;
         double error = setpoint - vel_.x;
         integral += error * dt;
         double derivative = (error - previous_error)/dt;
-        velocity = pid_kp*error + pid_ki*integral + pid_kd*derivative;
+        velocity += pid_kp*error + pid_ki*integral + pid_kd*derivative;
         previous_error = error;
       }
       else {
