@@ -80,6 +80,7 @@ private:
 
   // Vehicle State
   Vector3 pos_;
+  Vector3 vel_;
 
   // Action State
   std::mutex goal_mtx_;
@@ -136,6 +137,9 @@ private:
     pos_.x = msg.pose.pose.position.x;
     pos_.y = msg.pose.pose.position.y;
 
+    vel_.x = msg.twist.twist.linear.x;
+    vel_.y = msg.twist.twist.linear.y;
+
     // Robot Frame
     double qx = msg.pose.pose.orientation.x;
     double qy = msg.pose.pose.orientation.y;
@@ -182,6 +186,14 @@ private:
     double kv = goal->kv;
     double kp = goal->kp;
     double margin = goal->margin;
+    bool pid = goal->pid;
+    double setpoint = goal->setpoint;
+    double pid_kp = goal->pid_kp;
+    double pid_ki = goal->pid_ki;
+    double pid_kd = goal->pid_kd;
+
+    double previous_error = 0;
+    double integral = 0;
 
     RCLCPP_INFO(this->get_logger(), "GOAL: %f, %f", goal_pos_x, goal_pos_y);
 
@@ -198,7 +210,18 @@ private:
         break;
       }
 
-      double velocity = kv * distance;
+      double velocity = 0;
+      if (pid) {
+        double dt = rate.period().count();
+        double error = setpoint - vel_.x;
+        integral += error * dt;
+        double derivative = (error - previous_error)/dt;
+        velocity = pid_kp*error + pid_ki*integral + pid_kd*derivative;
+        previous_error = error;
+      }
+      else {
+        velocity = kv * distance;
+      }
       double desiredHeading = std::atan2(goal_pos_y - pos_.y, goal_pos_x - pos_.x);
       double headingError = std::atan2(std::sin(desiredHeading - current_angle_), std::cos(desiredHeading - current_angle_));
       double steering = kp * headingError;

@@ -3,6 +3,10 @@ float32 margin
 float32 kv
 float32 kp
 bool pid
+float32 setpoint
+float32 pid_kp
+float32 pid_ki
+float32 pid_kd
 ---
 float32[] position
 ---
