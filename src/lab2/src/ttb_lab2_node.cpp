@@ -573,6 +573,88 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
 
 };
 
+  void execute_pursuit(const std::shared_ptr<PursuitHandle> handle) {
+    std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
+    auto goal = handle->get_goal();
+    auto feedback = std::make_shared<Pursuit::Feedback>();
+    auto result = std::make_shared<Pursuit::Result>();
+
+    double radius = 1;
+    int total_points = 30;
+    if (goal->shape == Pursuit::Goal::STAR) {
+      total_points = 5; // 5 vertices, connected every 2nd one = pentagram
+    }
+    double deg_per_point = 360/total_points;
+    double rad_per_point = (M_PI * deg_per_point) / 180; //convert from deg to rad
+    std::vector<double> points_x; // establish list
+    std::vector<double> points_y; // establish list
+    int point_select = 0;
+    for (int i = 0; i < total_points; i++) { // go through each of the points and establish cartesian coordinates for the circle
+      double x_val_n;
+      double y_val_n;
+      if (goal->shape == Pursuit::Goal::STAR) {
+        x_val_n = radius*std::cos(2*i*rad_per_point); // skip every other vertex (144 deg step)
+        y_val_n = radius*std::sin(2*i*rad_per_point);
+      }
+      else { // CIRCLE
+        x_val_n = radius*std::cos(i*deg_per_point);
+        y_val_n = radius*std::sin(i*deg_per_point);
+      }
+      points_x.push_back(x_val_n);
+      points_y.push_back(y_val_n);
+    }
+
+    // take current odometry, add the values of points to the current odom position as the new point and follow it dynamically
+    // new points are x_d, y_d. Go to goal for [x_d, y_d]
+    double x_d = pos_.x + points_x[point_select]; // [CHANGE #2] declared here so it compiles
+    double y_d = pos_.y + points_y[point_select];
+
+    double kp = 0; //tune
+    double ki = 0; //tune
+    double dist_d = .1; // distance d_d behind the pursuit point that the robot follows
+    double x_error = (x_d - pos_.x); // x pulled from odometry
+    double y_error = (y_d - pos_.y); // y pulled from odometry
+    double x_error_2 = (x_d - pos_.x) * (x_d - pos_.x);
+    double y_error_2 = (y_d - pos_.y) * (y_d - pos_.y);
+    double follow_error = (std::sqrt(x_error_2 + y_error_2) - dist_d); // from lecture 3
+    double follow_threshold = dist_d * 1.5; // give threshold before resetting the point
+
+    double slope_quotient = y_error/x_error;
+    double theta_d = std::atan(slope_quotient); // use arctan for angle error
+
+    double angle_error = theta_d - current_angle_; // current angle from odom quaternion to euler convert
+    angle_error = std::atan2(std::sin(angle_error), std::cos(angle_error)); // using atan2 from Lecture 3
+    double abs_error = std::fabs(angle_error);
+    (void)abs_error; // unused in lab2wip
+
+    double dt = 0.1;
+
+    double integral = 0;
+    double output = 0;
+    Twist twist_cmd;
+
+    // integral = integral + error * dt
+    integral = integral + follow_error * dt;
+
+    // output = output + PID terms
+    output = output
+          + kp * follow_error
+          + ki * integral;
+
+    // Send PID output to robot
+    twist_cmd.linear.x = output;
+    twist_cmd.angular.z = 0; // dynamic value based upon alignment with the path itself, should be v=r*theta related
+
+    pub_twist_->publish(twist_cmd);
+
+    // when follow error is less than a threshold, increment the follow point to the next step in [x_points, y_points]
+    if (follow_error < follow_threshold) {
+      point_select += 1;
+      x_d = points_x[point_select];
+      y_d = points_y[point_select];
+    } // robot should then have the new point be more than .15 meters away and thus should direct towards the new point
+  }
+};
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
