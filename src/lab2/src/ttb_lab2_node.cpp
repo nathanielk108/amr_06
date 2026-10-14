@@ -66,6 +66,11 @@ class TTBLab2Node : public rclcpp::Node {
     TRACK_SHAPE,
   };
 
+  enum Shape {
+    CIRC, 
+    STAR
+  };
+
 private:
   rclcpp::TimerBase::SharedPtr timer_;
 
@@ -596,7 +601,7 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
         x_val_n = radius*std::cos(2*i*rad_per_point); // skip every other vertex (144 deg step)
         y_val_n = radius*std::sin(2*i*rad_per_point);
       }
-      else { // CIRCLE
+      else if (goal->shape == Pursuit::Goal::CIRC) { // CIRCLE
         x_val_n = radius*std::cos(i*deg_per_point);
         y_val_n = radius*std::sin(i*deg_per_point);
       }
