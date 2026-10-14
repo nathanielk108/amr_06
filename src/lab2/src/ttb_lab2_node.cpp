@@ -281,7 +281,7 @@ rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const s
     goal_active_ = false;
   }
 
-  void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
+void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
   std::string goal_name {
     rclcpp_action::to_string(handle->get_goal_id())
   };
@@ -292,21 +292,22 @@ rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const s
   auto result = std::make_shared<MakeSquare::Result>();
 
   double side = goal->side_length;
+  bool smooth = goal->smooth;
 
-  // Save where the square starts
+  // Save starting pose
   double start_x = pos_.x;
   double start_y = pos_.y;
   double start_angle = current_angle_;
 
   /*
-   * Define the four corners in the robot's LOCAL starting frame:
+   * Four corners in the robot's LOCAL starting frame:
    *
    * start ---- corner 1
    *   |            |
    *   |            |
    * corner 3 -- corner 2
    *
-   * corner 4 is starting point.
+   * corner 4 = starting point
    */
   double local_x[4] = {
     side,
@@ -322,158 +323,222 @@ rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const s
     0.0
   };
 
+  // Convert corners into global odometry coordinates
+  double corner_x[4];
+  double corner_y[4];
+
+  for (int i = 0; i < 4; i++) {
+    corner_x[i] =
+        start_x
+        + local_x[i] * std::cos(start_angle)
+        - local_y[i] * std::sin(start_angle);
+
+    corner_y[i] =
+        start_y
+        + local_x[i] * std::sin(start_angle)
+        + local_y[i] * std::cos(start_angle);
+  }
+
   rclcpp::WallRate rate(10);
 
-  double total_distance = 0.0;
-  double previous_x = pos_.x;
-  double previous_y = pos_.y;
+  // =========================================================
+  // SMOOTH MODE
+  // Constant linear velocity through all four points
+  // =========================================================
+  if (smooth) {
 
-  for (int corner = 0; corner < 4 && rclcpp::ok(); corner++) {
+    const double velocity = 0.2;
+    const double kp = 1.5;
+    const double corner_margin = 0.08;
 
-    if (handle->is_canceling()) {
-      break;
-    }
+    int corner = 0;
 
-    // Convert the corner from the robot's starting frame
-    // into the global odometry frame.
-    double goal_x =
-        start_x
-        + local_x[corner] * std::cos(start_angle)
-        - local_y[corner] * std::sin(start_angle);
-
-    double goal_y =
-        start_y
-        + local_x[corner] * std::sin(start_angle)
-        + local_y[corner] * std::cos(start_angle);
-
-    RCLCPP_INFO(
-        this->get_logger(),
-        "Corner %d: (%f, %f)",
-        corner + 1,
-        goal_x,
-        goal_y
-    );
-
-    // STEP 1: TURN TOWARD CORNER
-
-    while (rclcpp::ok()) {
+    while (rclcpp::ok() && corner < 4) {
 
       if (handle->is_canceling()) {
         break;
       }
 
-      double desired_heading =
-          std::atan2(goal_y - pos_.y, goal_x - pos_.x);
-
-      double heading_error =
-          std::atan2(
-              std::sin(desired_heading - current_angle_),
-              std::cos(desired_heading - current_angle_)
-          );
-
-      // About 3 degrees
-      if (std::abs(heading_error) < 0.05) {
-        break;
-      }
-
-      Twist turn_twist;
-
-      if (goal->pid) {
-        // Proportional heading control
-        double kp_turn = 1.5;
-        turn_twist.angular.z = kp_turn * heading_error;
-      }
-      else {
-        // Bang-bang control, but based on sensor feedback
-        turn_twist.angular.z =
-            (heading_error > 0.0) ? 0.5 : -0.5;
-      }
-
-      pub_twist_->publish(turn_twist);
-
-      rate.sleep();
-    }
-
-    // Fully stop before moving forward
-    pub_twist_->publish(Twist());
-
-    if (handle->is_canceling()) {
-      break;
-    }
-
-    // STEP 2: DRIVE STRAIGHT TO CORNER
-
-    while (rclcpp::ok()) {
-
-      if (handle->is_canceling()) {
-        break;
-      }
-
-      double dx = goal_x - pos_.x;
-      double dy = goal_y - pos_.y;
+      double dx = corner_x[corner] - pos_.x;
+      double dy = corner_y[corner] - pos_.y;
 
       double distance = std::sqrt(dx * dx + dy * dy);
 
-      // Corner reached
-      if (distance < 0.05) {
-        break;
+      // Close enough to this corner:
+      // immediately begin steering toward the next one.
+      if (distance < corner_margin) {
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Reached Corner %d",
+            corner + 1
+        );
+
+        corner++;
+
+        if (corner >= 4) {
+          break;
+        }
+
+        // Recalculate using the next corner
+        dx = corner_x[corner] - pos_.x;
+        dy = corner_y[corner] - pos_.y;
+        distance = std::sqrt(dx * dx + dy * dy);
       }
 
-      double desired_heading = std::atan2(dy, dx);
+      // Desired heading toward current target
+      double desired_heading =
+          std::atan2(dy, dx);
 
+      // Heading error based on odometry feedback
       double heading_error =
           std::atan2(
               std::sin(desired_heading - current_angle_),
               std::cos(desired_heading - current_angle_)
           );
 
-      Twist drive_twist;
+      Twist square_twist;
 
-      if (goal->pid) {
-        // Similar to your GoToGoal controller
-        double kv = 0.5;
-        double kp = 1.5;
+      // Constant linear velocity
+      square_twist.linear.x = velocity;
 
-        drive_twist.linear.x = kv * distance;
-        drive_twist.angular.z = kp * heading_error;
+      // Continuously steer based on sensor feedback
+      square_twist.angular.z = kp * heading_error;
 
-        // Don't let it get excessively fast
-        if (drive_twist.linear.x > 0.3) {
-          drive_twist.linear.x = 0.3;
-        }
-      }
-      else {
-        // Constant forward velocity with heading correction
-        drive_twist.linear.x = 0.2;
+      pub_twist_->publish(square_twist);
 
-        double kp = 1.0;
-        drive_twist.angular.z = kp * heading_error;
-      }
-
-      pub_twist_->publish(drive_twist);
-
-      // Distance traveled since the last loop
-      double step_dx = pos_.x - previous_x;
-      double step_dy = pos_.y - previous_y;
-
-      total_distance +=
-          std::sqrt(step_dx * step_dx + step_dy * step_dy);
-
-      previous_x = pos_.x;
-      previous_y = pos_.y;
-
-      // Action feedback
-    feedback->distance = static_cast<float>(distance);
-    handle->publish_feedback(feedback);
+      feedback->distance = static_cast<float>(distance);
+      handle->publish_feedback(feedback);
 
       rate.sleep();
     }
-
-    // Stop at each corner before beginning the next turn
-    pub_twist_->publish(Twist());
   }
 
-  // Make absolutely sure robot stops
+  // =========================================================
+  // STOP, TURN, AND GO MODE
+  // =========================================================
+  else {
+
+    const double corner_margin = 0.05;
+    const double heading_margin = 0.05;
+    const double kp_turn = 1.5;
+    const double kp_drive = 1.5;
+    const double kv = 0.5;
+    const double max_velocity = 0.3;
+
+    for (int corner = 0; corner < 4 && rclcpp::ok(); corner++) {
+
+      if (handle->is_canceling()) {
+        break;
+      }
+
+      double goal_x = corner_x[corner];
+      double goal_y = corner_y[corner];
+
+      RCLCPP_INFO(
+          this->get_logger(),
+          "Moving to Corner %d: (%f, %f)",
+          corner + 1,
+          goal_x,
+          goal_y
+      );
+
+      // -------------------------------------------------------
+      // STEP 1: TURN TOWARD CORNER
+      // -------------------------------------------------------
+      while (rclcpp::ok()) {
+
+        if (handle->is_canceling()) {
+          break;
+        }
+
+        double desired_heading =
+            std::atan2(
+                goal_y - pos_.y,
+                goal_x - pos_.x
+            );
+
+        double heading_error =
+            std::atan2(
+                std::sin(desired_heading - current_angle_),
+                std::cos(desired_heading - current_angle_)
+            );
+
+        // Stop turning once aligned
+        if (std::abs(heading_error) < heading_margin) {
+          break;
+        }
+
+        Twist turn_twist;
+
+        turn_twist.linear.x = 0.0;
+        turn_twist.angular.z = kp_turn * heading_error;
+
+        pub_twist_->publish(turn_twist);
+
+        rate.sleep();
+      }
+
+      // Stop before moving forward
+      pub_twist_->publish(Twist());
+
+      if (handle->is_canceling()) {
+        break;
+      }
+
+      // -------------------------------------------------------
+      // STEP 2: DRIVE TO CORNER
+      // -------------------------------------------------------
+      while (rclcpp::ok()) {
+
+        if (handle->is_canceling()) {
+          break;
+        }
+
+        double dx = goal_x - pos_.x;
+        double dy = goal_y - pos_.y;
+
+        double distance = std::sqrt(dx * dx + dy * dy);
+
+        // Corner reached
+        if (distance < corner_margin) {
+          break;
+        }
+
+        double desired_heading =
+            std::atan2(dy, dx);
+
+        double heading_error =
+            std::atan2(
+                std::sin(desired_heading - current_angle_),
+                std::cos(desired_heading - current_angle_)
+            );
+
+        double velocity = kv * distance;
+
+        if (velocity > max_velocity) {
+          velocity = max_velocity;
+        }
+
+        Twist drive_twist;
+
+        drive_twist.linear.x = velocity;
+        drive_twist.angular.z = kp_drive * heading_error;
+
+        pub_twist_->publish(drive_twist);
+
+        feedback->distance = static_cast<float>(distance);
+        handle->publish_feedback(feedback);
+
+        rate.sleep();
+      }
+
+      // Stop at corner before turning toward next one
+      pub_twist_->publish(Twist());
+    }
+  }
+
+  // Stop after completing either mode
   pub_twist_->publish(Twist());
 
   result->position = {
@@ -481,8 +546,8 @@ rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const s
     static_cast<float>(pos_.y)
   };
 
-
   if (handle->is_canceling()) {
+
     RCLCPP_INFO(
         this->get_logger(),
         "%s MakeSquare Action Cancelled",
@@ -492,6 +557,7 @@ rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const s
     handle->canceled(result);
   }
   else {
+
     RCLCPP_INFO(
         this->get_logger(),
         "%s MakeSquare Action Succeeded",
@@ -504,6 +570,7 @@ rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const s
   std::lock_guard<std::mutex> lock(goal_mtx_);
   goal_active_ = false;
 }
+
 };
 
 

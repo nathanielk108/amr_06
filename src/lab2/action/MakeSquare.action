@@ -1,5 +1,5 @@
 float32 side_length
-bool pid
+bool smooth
 ---
 float32[] position
 ---

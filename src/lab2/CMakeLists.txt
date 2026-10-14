@@ -23,6 +23,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/GoToGoal.action"
+  "action/MakeSquare.action"
 )
 
 ament_export_dependencies(rosidl_default_runtime)
@@ -39,8 +40,8 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-add_executable(ttb_lab2_node src/ttb_lab2_node)
-add_executable(turtlesim_lab2_node src/turtlesim_lab2_node)
+add_executable(ttb_lab2_node src/ttb_lab2_node.cpp)
+add_executable(turtlesim_lab2_node src/turtlesim_lab2_node.cpp)
 ament_target_dependencies(turtlesim_lab2_node rclcpp rclcpp_action nav_msgs geometry_msgs sensor_msgs turtlesim)
 ament_target_dependencies(ttb_lab2_node rclcpp rclcpp_action nav_msgs geometry_msgs sensor_msgs irobot_create_msgs)
 
