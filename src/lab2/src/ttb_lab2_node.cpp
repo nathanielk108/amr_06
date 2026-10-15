@@ -608,8 +608,8 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
     auto feedback = std::make_shared<PursuePath::Feedback>();
     auto result = std::make_shared<PursuePath::Result>();
-    auto goal = handle->get_goal();
-    int shape = goal->shape; // CIRC or STAR selection variable
+    
+    int shape = CIRC; // CIRC or STAR selection variable
 
     double radius = 1.0;
     int total_points = 30; // can change number of points per circle
