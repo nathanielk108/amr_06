@@ -604,14 +604,14 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
   goal_active_ = false;
 }
 
-  void execute_pursuit(const std::shared_ptr<PursuitHandle> handle) {
+  void execute_pursuit(const std::shared_ptr<PursuePathHandle> handle) {
     std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
-    auto feedback = std::make_shared<Pursuit::Feedback>();
-    auto result = std::make_shared<Pursuit::Result>();
+    auto feedback = std::make_shared<PursuePath::Feedback>();
+    auto result = std::make_shared<PursuePath::Result>();
+    auto goal = handle->get_goal();
+    int shape = goal->shape; // CIRC or STAR selection variable
 
-    int shape = CIRC; // CIRC or STAR selection variable
-
-    double radius = 1;
+    double radius = 1.0;
     int total_points = 30; // can change number of points per circle
     if (shape == STAR) {
       total_points = 5; // typical 5 point star
@@ -624,11 +624,11 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     for (int i = 0; i < total_points; i++) { // go through each of the points and establish cartesian coordinates for the circle
       double x_val_n;
       double y_val_n;
-      if (shape == CIRC) {
+      if (shape == lab2::action::PursuePath::Goal::CIRC) {
         x_val_n = radius*std::cos(i*rad_per_point); 
         y_val_n = radius*std::sin(i*rad_per_point);
       }
-      else if (shape == STAR) {
+      else if (shape == lab2::action::PursuePath::Goal::STAR) {
         x_val_n = radius*std::cos(2*i*rad_per_point); // making a double step so two full times around will hit all 5 points, 
         y_val_n = radius*std::sin(2*i*rad_per_point);
       }
@@ -645,7 +645,7 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     double integral = 0;
     double output = 0;
     double kp = 1.0; //tune
-    double ki = 0.2; //tune
+    double ki = 0.1; //tune
     double kh = 0.4; // tune
     double dist_d = .1; // distance d_d behind the pursuit point that the robot follows
     double follow_threshold = dist_d * 1.5; // give threshold before resetting the point, tunable
@@ -674,12 +674,12 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     double angle_error = theta_d - current_angle_; // current angle from odom quaternion to euler convert
     angle_error = std::atan2(std::sin(angle_error), std::cos(angle_error)); // using atan2 from Lecture 3
     double abs_error = std::fabs(angle_error);
-    (void)abs_error; // unused in lab2wip
 
     integral = integral + follow_error * dt; // PID
-    output = output
-          + kp * follow_error
-          + ki * integral;
+    output = output + kp * follow_error + ki * integral;
+    if (output < 0) {
+      output = 0;
+    }
 
     twist_cmd.linear.x = output;
     twist_cmd.angular.z = kh * angle_error; // dynamic value based upon alignment with the path itself, should be v=r*theta related
@@ -707,6 +707,7 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
   } 
   else {
     RCLCPP_INFO(this->get_logger(), "%s PursuePath Action Succeeded", goal_name.c_str());
+    handle->succeed(result);
   }
 
     std::lock_guard<std::mutex> lock(goal_mtx_);
