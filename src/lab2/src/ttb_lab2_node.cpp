@@ -16,6 +16,7 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <lab2/action/go_to_goal.hpp>
 #include <lab2/action/make_square.hpp>
+#include <lab2/action/pursue_path.hpp>
 
 #include <geometry_msgs/msg/twist.hpp>
 #include <irobot_create_msgs/msg/ir_intensity_vector.hpp>
@@ -39,6 +40,9 @@ class TTBLab2Node : public rclcpp::Node {
 
   using MakeSquare = lab2::action::MakeSquare;
   using MakeSquareHandle = rclcpp_action::ServerGoalHandle<MakeSquare>;
+
+  using PursuePath = lab2::action::PursuePath;
+  using PursuePathHandle = rclcpp_action::ServerGoalHandle<PursuePath>;
 
 
   enum JoyAxes { L_X = 0, L_Y, L_TRIG, R_X, R_Y, R_TRIG, D_X, D_Y };
@@ -85,6 +89,8 @@ private:
   // Actions
   rclcpp_action::Server<GoToGoal>::SharedPtr serv_go_to_goal_;
   rclcpp_action::Server<MakeSquare>::SharedPtr serv_make_square_;
+  rclcpp_action::Server<PursuePath>::SharedPtr serv_pursue_path_;
+
 
   // Commands
   Twist joy_cmd_;
@@ -132,6 +138,14 @@ public:
     std::bind(&TTBLab2Node::handle_goal_make_square, this, _1, _2),
     std::bind(&TTBLab2Node::handle_cancel_make_square, this, _1),
     std::bind(&TTBLab2Node::handle_accepted_make_square, this, _1)
+    );
+
+    serv_pursue_path_ = rclcpp_action::create_server<PursuePath>(
+    this,
+    "/TTB06/pursue_path",
+    std::bind(&TTBLab2Node::handle_goal_pursue_path, this, _1, _2),
+    std::bind(&TTBLab2Node::handle_cancel_pursue_path, this, _1),
+    std::bind(&TTBLab2Node::handle_accepted_pursue_path, this, _1)
     );
 
     pub_twist_ = this->create_publisher<Twist>("/TTB06/cmd_vel", 10);
@@ -191,21 +205,35 @@ private:
   rclcpp_action::GoalResponse handle_goal_make_square(const rclcpp_action::GoalUUID &uuid, [[maybe_unused]] std::shared_ptr<const MakeSquare::Goal> goal) {
 
     return handle_goal(uuid);
-    }
+  }
 
-rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const std::shared_ptr<MakeSquareHandle> handle) {
+  rclcpp_action::CancelResponse handle_cancel_make_square([[maybe_unused]] const std::shared_ptr<MakeSquareHandle> handle) {
     return rclcpp_action::CancelResponse::ACCEPT;
-    }
+  }
 
-    void handle_accepted_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
+  rclcpp_action::GoalResponse handle_goal_pursue_path(const rclcpp_action::GoalUUID &uuid, [[maybe_unused]] std::shared_ptr<const PursuePath::Goal> goal) {
+    return handle_goal(uuid);
+  }
+
+  rclcpp_action::CancelResponse handle_cancel_pursue_path([[maybe_unused]] const std::shared_ptr<PursuePathHandle> handle) {
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  void handle_accepted_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
 
     std::thread{std::bind(&TTBLab2Node::execute_make_square, this, _1), handle}.detach();
-}
+  }
+
+  void handle_accepted_pursue_path(const std::shared_ptr<PursuePathHandle> handle) {
+
+    std::thread{std::bind(&TTBLab2Node::execute_pursuit, this, _1), handle}.detach();
+  }
 
   void handle_accepted_go_to_goal(const std::shared_ptr<GoToGoalHandle> handle) {
     auto goal = handle->get_goal();
     std::thread{std::bind(&TTBLab2Node::execute_go_to_goal, this, _1), handle}.detach();
   }
+
 
   void execute_go_to_goal(const std::shared_ptr<GoToGoalHandle> handle) {
     std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
@@ -576,8 +604,6 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
   goal_active_ = false;
 }
 
-};
-
   void execute_pursuit(const std::shared_ptr<PursuitHandle> handle) {
     std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
     auto feedback = std::make_shared<Pursuit::Feedback>();
@@ -688,6 +714,7 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     std::lock_guard<std::mutex> lock(goal_mtx_);
     goal_active_ = false;
   }
+};
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
