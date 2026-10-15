@@ -616,11 +616,10 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     if (shape == STAR) {
       total_points = 5; // typical 5 point star
     }
-    double deg_per_point = 360/total_points;
+    double deg_per_point = 360.0/total_points;
     double rad_per_point = (M_PI * deg_per_point) / 180; //convert from deg to rad
     std::vector<double> points_x; // establish list
     std::vector<double> points_y; // establish list
-    int point_select = 0;
     for (int i = 0; i < total_points; i++) { // go through each of the points and establish cartesian coordinates for the circle
       double x_val_n;
       double y_val_n;
@@ -636,64 +635,34 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
       points_y.push_back(y_val_n);
     }
 
-    // take current odometry, add the values of points to the current odom position as the new point and follow it dynamically
-    // new points are x_d, y_d. Go to goal for [x_d, y_d]
-    double x_d = pos_.x + points_x[point_select]; // [CHANGE #2] declared here so it compiles
-    double y_d = pos_.y + points_y[point_select];
 
-    double dt = 0.1;
-    double integral = 0;
-    double output = 0;
     double kp = 1.0; //tune
-    double ki = 0.1; //tune
-    double kh = 0.4; // tune
-    double dist_d = .1; // distance d_d behind the pursuit point that the robot follows
-    double follow_threshold = dist_d * 1.5; // give threshold before resetting the point, tunable
+    double kv = 0.4; // tune
 
     Twist twist_cmd;
 
 
     rclcpp::WallRate rate(10); // 10 Hz loop
-    while (rclcpp::ok()) {
+    size_t point_index = 0;
+    while (rclcpp::ok() && point_index < points_x.size()) {
       if (handle->is_canceling()) {
         break;
       }
-      if (point_select > 2*total_points) { // two iterations of the shape
-        break;
-      }
 
-    double x_error = (x_d - pos_.x); // x pulled from odometry
-    double y_error = (y_d - pos_.y); // y pulled from odometry
-    double x_error_2 = (x_d - pos_.x) * (x_d - pos_.x);
-    double y_error_2 = (y_d - pos_.y) * (y_d - pos_.y);
-    double follow_error = (std::sqrt(x_error_2 + y_error_2) - dist_d); // from lecture 3
+      double distance = std::sqrt((points_x[point_index] - pos_.x)*(points_x[point_index] - pos_.x) + (points_y[point_index] - pos_.y)*(points_y[point_index] - pos_.y));
 
-    double slope_quotient = y_error/x_error;
-    double theta_d = std::atan2(y_error, x_error); // use arctan for angle error
+      double velocity = kv * distance;
+      double desiredHeading = std::atan2(points_y[point_index] - pos_.y, points_x[point_index] - pos_.x);
+      double headingError = std::atan2(std::sin(desiredHeading - current_angle_), std::cos(desiredHeading - current_angle_));
+      double steering = kp * headingError;
 
-    double angle_error = theta_d - current_angle_; // current angle from odom quaternion to euler convert
-    angle_error = std::atan2(std::sin(angle_error), std::cos(angle_error)); // using atan2 from Lecture 3
-    double abs_error = std::fabs(angle_error);
-
-    integral = integral + follow_error * dt; // PID
-    output = output + kp * follow_error + ki * integral;
-    if (output < 0) {
-      output = 0;
-    }
-
-    twist_cmd.linear.x = output;
-    twist_cmd.angular.z = kh * angle_error; // dynamic value based upon alignment with the path itself, should be v=r*theta related
+    twist_cmd.linear.x = velocity;
+    twist_cmd.angular.z = steering; // dynamic value based upon alignment with the path itself, should be v=r*theta related
 
     pub_twist_->publish(twist_cmd);
+    point_index++;
 
-    // when follow error is less than a threshold, increment the follow point to the next step in [x_points, y_points]
-    if (follow_error < follow_threshold) {
-      point_select += 1;
-      x_d = points_x[point_select];
-      y_d = points_y[point_select];
-    } // robot should then have the new point be more than .15 meters away and thus should direct towards the new point
-
-    feedback->set__distance(follow_error);
+    feedback->set__distance(distance);
     handle->publish_feedback(feedback);
     rate.sleep();
   }
