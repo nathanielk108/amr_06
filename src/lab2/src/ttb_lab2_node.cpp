@@ -580,14 +580,15 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
 
   void execute_pursuit(const std::shared_ptr<PursuitHandle> handle) {
     std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
-    auto goal = handle->get_goal();
     auto feedback = std::make_shared<Pursuit::Feedback>();
     auto result = std::make_shared<Pursuit::Result>();
 
+    int shape = CIRC; // choose CIRCLE or STAR here
+
     double radius = 1;
     int total_points = 30;
-    if (goal->shape == Pursuit::Goal::STAR) {
-      total_points = 5; // 5 vertices, connected every 2nd one = pentagram
+    if (shape == STAR) {
+      total_points = 5; // typical 5 point star
     }
     double deg_per_point = 360/total_points;
     double rad_per_point = (M_PI * deg_per_point) / 180; //convert from deg to rad
@@ -597,13 +598,13 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     for (int i = 0; i < total_points; i++) { // go through each of the points and establish cartesian coordinates for the circle
       double x_val_n;
       double y_val_n;
-      if (goal->shape == Pursuit::Goal::STAR) {
-        x_val_n = radius*std::cos(2*i*rad_per_point); // skip every other vertex (144 deg step)
-        y_val_n = radius*std::sin(2*i*rad_per_point);
+      if (shape == CIRC) {
+        x_val_n = radius*std::cos(i*rad_per_point); 
+        y_val_n = radius*std::sin(i*rad_per_point);
       }
-      else if (goal->shape == Pursuit::Goal::CIRC) { // CIRCLE
-        x_val_n = radius*std::cos(i*deg_per_point);
-        y_val_n = radius*std::sin(i*deg_per_point);
+      else if (shape == STAR) {
+        x_val_n = radius*std::cos(2*i*rad_per_point); // making a double step so two full times around will hit all 5 points, 
+        y_val_n = radius*std::sin(2*i*rad_per_point);
       }
       points_x.push_back(x_val_n);
       points_y.push_back(y_val_n);
@@ -614,9 +615,25 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     double x_d = pos_.x + points_x[point_select]; // [CHANGE #2] declared here so it compiles
     double y_d = pos_.y + points_y[point_select];
 
-    double kp = 0; //tune
-    double ki = 0; //tune
+    double dt = 0.1;
+    double integral = 0;
+    double output = 0;
+    double kp = 1.0; //tune
+    double ki = 0.2; //tune
+    double kh = 0.4;
     double dist_d = .1; // distance d_d behind the pursuit point that the robot follows
+    Twist twist_cmd;
+
+
+    rclcpp::WallRate rate(10); // 10 Hz loop
+    while (rclcpp::ok()) {
+      if (handle->is_canceling()) {
+        break;
+      }
+      if (point_select > 2*total_points) {
+        break;
+      }
+
     double x_error = (x_d - pos_.x); // x pulled from odometry
     double y_error = (y_d - pos_.y); // y pulled from odometry
     double x_error_2 = (x_d - pos_.x) * (x_d - pos_.x);
@@ -632,12 +649,6 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     double abs_error = std::fabs(angle_error);
     (void)abs_error; // unused in lab2wip
 
-    double dt = 0.1;
-
-    double integral = 0;
-    double output = 0;
-    Twist twist_cmd;
-
     // integral = integral + error * dt
     integral = integral + follow_error * dt;
 
@@ -648,7 +659,7 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
 
     // Send PID output to robot
     twist_cmd.linear.x = output;
-    twist_cmd.angular.z = 0; // dynamic value based upon alignment with the path itself, should be v=r*theta related
+    twist_cmd.angular.z = kh * angle_error; // dynamic value based upon alignment with the path itself, should be v=r*theta related
 
     pub_twist_->publish(twist_cmd);
 
@@ -658,8 +669,25 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
       x_d = points_x[point_select];
       y_d = points_y[point_select];
     } // robot should then have the new point be more than .15 meters away and thus should direct towards the new point
+
+    feedback->set__distance(follow_error);
+    handle->publish_feedback(feedback);
   }
-};
+
+    pub_twist_->publish(Twist());
+    result->position = {static_cast<float>(pos_.x), static_cast<float>(pos_.y)};
+    if (handle->is_canceling()) {
+      RCLCPP_INFO(this->get_logger(), "%s Action Cancelled", goal_name.c_str());
+      handle->canceled(result);
+    }
+    else {
+      RCLCPP_INFO(this->get_logger(), "%s Action Succeeded", goal_name.c_str());
+      handle->succeed(result);
+    }
+
+    std::lock_guard<std::mutex> lock(goal_mtx_);
+    goal_active_ = false;
+  }
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
