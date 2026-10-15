@@ -609,10 +609,10 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     auto feedback = std::make_shared<Pursuit::Feedback>();
     auto result = std::make_shared<Pursuit::Result>();
 
-    int shape = CIRC; // choose CIRCLE or STAR here
+    int shape = CIRC; // CIRC or STAR selection variable
 
     double radius = 1;
-    int total_points = 30;
+    int total_points = 30; // can change number of points per circle
     if (shape == STAR) {
       total_points = 5; // typical 5 point star
     }
@@ -646,8 +646,10 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     double output = 0;
     double kp = 1.0; //tune
     double ki = 0.2; //tune
-    double kh = 0.4;
+    double kh = 0.4; // tune
     double dist_d = .1; // distance d_d behind the pursuit point that the robot follows
+    double follow_threshold = dist_d * 1.5; // give threshold before resetting the point, tunable
+
     Twist twist_cmd;
 
 
@@ -656,7 +658,7 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
       if (handle->is_canceling()) {
         break;
       }
-      if (point_select > 2*total_points) {
+      if (point_select > 2*total_points) { // two iterations of the shape
         break;
       }
 
@@ -665,25 +667,20 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     double x_error_2 = (x_d - pos_.x) * (x_d - pos_.x);
     double y_error_2 = (y_d - pos_.y) * (y_d - pos_.y);
     double follow_error = (std::sqrt(x_error_2 + y_error_2) - dist_d); // from lecture 3
-    double follow_threshold = dist_d * 1.5; // give threshold before resetting the point
 
     double slope_quotient = y_error/x_error;
-    double theta_d = std::atan(slope_quotient); // use arctan for angle error
+    double theta_d = std::atan2(y_error, x_error); // use arctan for angle error
 
     double angle_error = theta_d - current_angle_; // current angle from odom quaternion to euler convert
     angle_error = std::atan2(std::sin(angle_error), std::cos(angle_error)); // using atan2 from Lecture 3
     double abs_error = std::fabs(angle_error);
     (void)abs_error; // unused in lab2wip
 
-    // integral = integral + error * dt
-    integral = integral + follow_error * dt;
-
-    // output = output + PID terms
+    integral = integral + follow_error * dt; // PID
     output = output
           + kp * follow_error
           + ki * integral;
 
-    // Send PID output to robot
     twist_cmd.linear.x = output;
     twist_cmd.angular.z = kh * angle_error; // dynamic value based upon alignment with the path itself, should be v=r*theta related
 
@@ -698,18 +695,19 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
 
     feedback->set__distance(follow_error);
     handle->publish_feedback(feedback);
+    rate.sleep();
   }
 
-    pub_twist_->publish(Twist());
-    result->position = {static_cast<float>(pos_.x), static_cast<float>(pos_.y)};
-    if (handle->is_canceling()) {
-      RCLCPP_INFO(this->get_logger(), "%s Action Cancelled", goal_name.c_str());
-      handle->canceled(result);
-    }
-    else {
-      RCLCPP_INFO(this->get_logger(), "%s Action Succeeded", goal_name.c_str());
-      handle->succeed(result);
-    }
+  pub_twist_->publish(Twist());
+  result->position = {static_cast<float>(pos_.x), static_cast<float>(pos_.y)};
+    
+  if (handle->is_canceling()) {
+    RCLCPP_INFO(this->get_logger(), "%s PursuePath Action Cancelled", goal_name.c_str());
+    handle->canceled(result);
+  } 
+  else {
+    RCLCPP_INFO(this->get_logger(), "%s PursuePath Action Succeeded", goal_name.c_str());
+  }
 
     std::lock_guard<std::mutex> lock(goal_mtx_);
     goal_active_ = false;
