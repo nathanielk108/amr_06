@@ -608,7 +608,7 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
     std::string goal_name {rclcpp_action::to_string(handle->get_goal_id())};
     auto feedback = std::make_shared<PursuePath::Feedback>();
     auto result = std::make_shared<PursuePath::Result>();
-    
+
     int shape = CIRC; // CIRC or STAR selection variable
 
     double radius = 1.0;
@@ -631,8 +631,12 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
         x_val_n = radius*std::cos(2*i*rad_per_point); // making a double step so two full times around will hit all 5 points, 
         y_val_n = radius*std::sin(2*i*rad_per_point);
       }
-      points_x.push_back(x_val_n);
-      points_y.push_back(y_val_n);
+      else {
+        x_val_n = 0;
+        y_val_n = 0;
+      }
+      points_x.push_back(pos_.x + x_val_n);
+      points_y.push_back(pos_.y + y_val_n);
     }
 
 
@@ -669,7 +673,7 @@ void execute_make_square(const std::shared_ptr<MakeSquareHandle> handle) {
 
   pub_twist_->publish(Twist());
   result->position = {static_cast<float>(pos_.x), static_cast<float>(pos_.y)};
-    
+
   if (handle->is_canceling()) {
     RCLCPP_INFO(this->get_logger(), "%s PursuePath Action Cancelled", goal_name.c_str());
     handle->canceled(result);
