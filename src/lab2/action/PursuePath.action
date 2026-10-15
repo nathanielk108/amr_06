@@ -1,4 +1,4 @@
-uint8 CIRCLE=0
+uint8 CIRC=0
 uint8 STAR=1
 uint8 shape
 ---
