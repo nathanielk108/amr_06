@@ -24,6 +24,7 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/GoToGoal.action"
   "action/MakeSquare.action"
+  "action/PursuePath.action"
 )
 
 ament_export_dependencies(rosidl_default_runtime)
