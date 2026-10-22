@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <algorithm>
 
 #include <rclcpp/create_timer.hpp>
 #include <rclcpp/executors.hpp>
@@ -43,8 +44,10 @@ private:
   // Vehicle State
   Vector3 pos_;
   Vector3 vel_;
+  Vector3 goal_;
 
   double current_angle_ = 0.0;
+  double laser_steering_ = 0.0;
 
 public:
   explicit Lab3Node() : rclcpp::Node("lab3_node") {
@@ -60,21 +63,35 @@ public:
         std::bind(&Lab3Node::odometry_callback, this, _1));
 
     sub_laser_scan_ = this->create_subscription<LaserScan>(
-      "/TTB06/scan",
-      rclcpp::QoS(
-        rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
-        rmw_qos_profile_sensor_data),
-      std::bind(&Lab3Node::laser_scan_callback, this, _1));
+        "/TTB06/scan",
+        rclcpp::QoS(
+          rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
+          rmw_qos_profile_sensor_data),
+        std::bind(&Lab3Node::laser_scan_callback, this, _1));
 
     pub_twist_ = this->create_publisher<Twist>("/TTB06/cmd_vel", 10);
 
     pos_.x = 0;
     pos_.y = 0;
     pos_.z = 0;
+
+    goal_.x = 1.5;
+    goal_.y = 0;
   }
 
   void command_loop_function() {
-    return;
+    double kg = 0.5;
+    double ka = 0.1;
+    // double distance = std::hypot(goal_.x - pos_.x, goal_.y - pos_.y);
+    double desiredHeading = std::atan2(goal_.y - pos_.y, goal_.x - pos_.x);
+    double headingError = std::atan2(std::sin(desiredHeading - current_angle_), std::cos(desiredHeading - current_angle_));
+
+    double steering = (kg * headingError) + (ka * laser_steering_);
+
+    Twist cmd;
+    cmd.linear.set__x(0.2);
+    cmd.angular.set__z(steering);
+
   }
 
   void odometry_callback(const Odometry &msg) {
@@ -94,7 +111,13 @@ public:
   }
 
   void laser_scan_callback(const LaserScan &msg) {
-    (void)msg;
+
+    for (size_t i = 0; i < msg.ranges.size(); ++i) {
+      double range = msg.ranges.at(i);
+      double angle = msg.angle_min + (msg.angle_increment * i);
+
+      laser_steering_ += range * angle;
+    }
   }
 };
 
