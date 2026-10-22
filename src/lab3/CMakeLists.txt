@@ -25,4 +25,10 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+add_executable(lab3_node src/lab3_node.cpp)
+ament_target_dependencies(lab3_node rclcpp sensor_msgs geometry_msgs nav_msgs irobot_create_msgs)
+
+install(TARGETS lab3_node
+        DESTINATION lib/${PROJECT_NAME})
+
 ament_package()
