@@ -11,12 +11,12 @@
 #include <rclcpp/subscription.hpp>
 #include <rclcpp/utilities.hpp>
 
-#include <geometry_msgs/msg/twist.hpp>
-#include <irobot_create_msgs/msg/ir_intensity_vector.hpp>
-#include <nav_msgs/msg/odometry.hpp>
-#include <rclcpp_action/server.hpp>
 #include <rmw/qos_profiles.h>
 #include <sensor_msgs/msg/joy.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <irobot_create_msgs/msg/ir_intensity_vector.hpp>
 
 using namespace std::chrono_literals;
 using namespace std::placeholders;
@@ -35,7 +35,7 @@ private:
   // Subscriptions
   rclcpp::Subscription<Joy>::SharedPtr sub_joy_;
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
-  rclcpp::Subscription<irobot_create_msgs::msg::IrIntensityVector>::SharedPtr sub_ir_;
+  rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
 
   // Publishers
   rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
@@ -58,6 +58,13 @@ public:
             rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
             rmw_qos_profile_sensor_data),
         std::bind(&Lab3Node::odometry_callback, this, _1));
+
+    sub_laser_scan_ = this->create_subscription<LaserScan>(
+      "/TTB06/scan",
+      rclcpp::QoS(
+        rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
+        rmw_qos_profile_sensor_data),
+      std::bind(&Lab3Node::laser_scan_callback, this, _1));
 
     pub_twist_ = this->create_publisher<Twist>("/TTB06/cmd_vel", 10);
 
@@ -84,6 +91,10 @@ public:
     double qz = msg.pose.pose.orientation.z;
     double qw = msg.pose.pose.orientation.w;
     current_angle_ = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)); // quarternion yaw angle
+  }
+
+  void laser_scan_callback(const LaserScan &msg) {
+    (void)msg;
   }
 };
 
