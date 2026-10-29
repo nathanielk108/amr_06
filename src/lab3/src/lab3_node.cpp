@@ -62,7 +62,7 @@ private:
   bool origin_rendered_ = false;
 
 public:
-  explicit Lab3Node() : public rclcpp::Node("lab3_node") {
+  explicit Lab3Node() : rclcpp::Node("lab3_node") {
 
     timer_ = this->create_wall_timer(
         100ms, std::bind(&Lab3Node::command_loop_function, this));
