@@ -26,7 +26,7 @@ using namespace sensor_msgs::msg;
 using namespace geometry_msgs::msg;
 using namespace nav_msgs::msg;
 
-class Lab3Node : rclcpp::Node {
+class Lab3Node : public rclcpp::Node {
 
 private:
   // Timers
