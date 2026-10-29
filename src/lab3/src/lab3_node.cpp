@@ -18,22 +18,21 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 
+
 using namespace std::chrono_literals;
 using namespace std::placeholders;
 
 using namespace sensor_msgs::msg;
 using namespace geometry_msgs::msg;
 using namespace nav_msgs::msg;
-using namespace irobot_create_msgs::msg;
 
-class Lab3Node : public rclcpp::Node {
+class Lab3Node : rclcpp::Node {
 
 private:
   // Timers
   rclcpp::TimerBase::SharedPtr timer_;
 
   // Subscriptions
-  rclcpp::Subscription<Joy>::SharedPtr sub_joy_;
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
   rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
 
@@ -63,7 +62,7 @@ private:
   bool origin_rendered_ = false;
 
 public:
-  explicit Lab3Node() : rclcpp::Node("lab3_node") {
+  explicit Lab3Node() : public rclcpp::Node("lab3_node") {
 
     timer_ = this->create_wall_timer(
         100ms, std::bind(&Lab3Node::command_loop_function, this));
@@ -137,24 +136,26 @@ public:
   }
 
   void laser_scan_callback(const LaserScan &msg) {
-    
+
+    double heading_error = std::atan2(std::sin(goal_heading - current_angle_), std::cos(goal_heading - current_angle_));
+
     double max_dist = -1.0;
     double free_space_heading = heading_error;
 
     for (size_t i = 0; i < msg.ranges.size(); ++i) {
       double range = msg.ranges.at(i);
       if (range > max_range_) {
-        range = max_range_
+        range = max_range_;
       }
       double d_i = std::max(0.001, range - robot_radius_);
       double angle = msg.angle_min + (msg.angle_increment * i);
       angle = std::atan2(std::sin(angle), std::cos(angle));
-      if (d_eff > max_dist) {
-        max_dist = d_eff;
-        best_free_angle = angle;
+      if (d_i > max_dist) {
+        max_dist = d_i;
+        free_space_heading = angle;
       }
     }
-    laser_steering_ = best_free_angle;
+    laser_steering_ = free_space_heading;
   }
 };
 
