@@ -137,6 +137,7 @@ public:
 
   void laser_scan_callback(const LaserScan &msg) {
 
+    double goal_heading = std::atan2(goal_.y - pos_.y, goal_.x - pos_.x);
     double heading_error = std::atan2(std::sin(goal_heading - current_angle_), std::cos(goal_heading - current_angle_));
 
     double max_dist = -1.0;
