@@ -116,153 +116,130 @@ public:
                 desired_heading - current_angle_));
 
     // Approximate robot footprint
-    double robot_radius = 0.18;
-    double safety_margin = 0.12;
+double robot_radius = 0.18;
+double safety_margin = 0.12;
 
-    double minimum_clearance =
-        robot_radius + safety_margin;
+double minimum_clearance =
+    robot_radius + safety_margin;
 
-    double detect_distance = 0.75;
-    double exit_distance = 0.55;
+double detect_distance = 0.75;
+double exit_distance = 0.45;
 
-    double speed = 0.2;
-    double steering = 0.0;
+double speed = 0.1;
+double steering = 0.0;
 
-    /*
-     * Normal go-to-goal behavior
-     */
-    if (avoid_mode_ == GO_TO_GOAL) {
+if (avoid_mode_ == GO_TO_GOAL) {
 
-      steering = 0.8 * heading_error;
+  steering = 0.8 * heading_error;
 
-      bool obstacle_ahead =
-          front_ < detect_distance ||
-          front_left_ < minimum_clearance ||
-          front_right_ < minimum_clearance;
+  bool obstacle_ahead =
+      front_ < detect_distance ||
+      front_left_ < minimum_clearance ||
+      front_right_ < minimum_clearance;
 
-      if (obstacle_ahead) {
+  if (obstacle_ahead) {
 
-        clear_count_ = 0;
+    clear_count_ = 0;
 
-        /*
-         * Choose the side with more space.
-         * Once chosen, stay in that avoidance mode.
-         */
-        if ((left_ + front_left_) >
-            (right_ + front_right_)) {
+    if ((left_ + front_left_) >
+        (right_ + front_right_)) {
 
-          avoid_mode_ = AVOID_LEFT;
+      avoid_mode_ = AVOID_LEFT;
+    }
+    else {
 
-          RCLCPP_INFO(
-              this->get_logger(),
-              "Obstacle detected: avoiding LEFT");
-        }
-        else {
+      avoid_mode_ = AVOID_RIGHT;
+    }
+  }
+}
 
-          avoid_mode_ = AVOID_RIGHT;
+if (avoid_mode_ == AVOID_LEFT) {
 
-          RCLCPP_INFO(
-              this->get_logger(),
-              "Obstacle detected: avoiding RIGHT");
-        }
-      }
+  /*
+   * First turn left until the front clears.
+   */
+  if (front_ < minimum_clearance ||
+      front_right_ < minimum_clearance) {
+
+    speed = 0.05;
+    steering = 0.8;
+  }
+
+  /*
+   * Once the front is clear, drive alongside
+   * the obstacle instead of continuing to turn.
+   */
+  else {
+
+    speed = 0.10;
+    steering = 0.0;
+
+    // Keep robot body away from obstacle on right
+    if (right_ < minimum_clearance) {
+      steering = 0.3;
     }
 
-    /*
-     * Avoid obstacle by turning left
-     */
-    if (avoid_mode_ == AVOID_LEFT) {
+    // Obstacle still beside robot
+    if (right_ < exit_distance ||
+        front_right_ < exit_distance) {
 
-      speed = 0.10;
-      steering = 0.7;
+      clear_count_ = 0;
+    }
+    else {
 
-      /*
-       * If obstacle gets too close to the front
-       * or right side, turn harder.
-       */
-      if (front_ < minimum_clearance ||
-          front_right_ < minimum_clearance ||
-          right_ < minimum_clearance) {
+      clear_count_++;
+    }
+  }
 
-        speed = 0.05;
-        steering = 1.0;
-      }
+  if (clear_count_ > 5) {
 
-      /*
-       * When avoiding left, obstacle should pass
-       * along the robot's right side.
-       *
-       * Do not return to goal behavior until the
-       * front and right side stay clear.
-       */
-      if (front_ > exit_distance &&
-          front_right_ > exit_distance &&
-          right_ > exit_distance) {
+    avoid_mode_ = GO_TO_GOAL;
+    clear_count_ = 0;
+  }
+}
 
-        clear_count_++;
-      }
-      else {
+else if (avoid_mode_ == AVOID_RIGHT) {
 
-        clear_count_ = 0;
-      }
+  /*
+   * First turn right until the front clears.
+   */
+  if (front_ < minimum_clearance ||
+      front_left_ < minimum_clearance) {
 
-      if (clear_count_ > 8) {
+    speed = 0.05;
+    steering = -0.8;
+  }
 
-        avoid_mode_ = GO_TO_GOAL;
-        clear_count_ = 0;
+  /*
+   * Drive alongside obstacle.
+   */
+  else {
 
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Obstacle cleared: returning to goal");
-      }
+    speed = 0.10;
+    steering = 0.0;
+
+    // Keep robot body away from obstacle on left
+    if (left_ < minimum_clearance) {
+      steering = -0.3;
     }
 
-    /*
-     * Avoid obstacle by turning right
-     */
-    else if (avoid_mode_ == AVOID_RIGHT) {
+    if (left_ < exit_distance ||
+        front_left_ < exit_distance) {
 
-      speed = 0.10;
-      steering = -0.7;
-
-      /*
-       * If obstacle gets too close to the front
-       * or left side, turn harder.
-       */
-      if (front_ < minimum_clearance ||
-          front_left_ < minimum_clearance ||
-          left_ < minimum_clearance) {
-
-        speed = 0.05;
-        steering = -1.0;
-      }
-
-      /*
-       * When avoiding right, obstacle should pass
-       * along the robot's left side.
-       */
-      if (front_ > exit_distance &&
-          front_left_ > exit_distance &&
-          left_ > exit_distance) {
-
-        clear_count_++;
-      }
-      else {
-
-        clear_count_ = 0;
-      }
-
-      if (clear_count_ > 8) {
-
-        avoid_mode_ = GO_TO_GOAL;
-        clear_count_ = 0;
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Obstacle cleared: returning to goal");
-      }
+      clear_count_ = 0;
     }
+    else {
 
+      clear_count_++;
+    }
+  }
+
+  if (clear_count_ > 5) {
+
+    avoid_mode_ = GO_TO_GOAL;
+    clear_count_ = 0;
+  }
+}
     steering =
         std::clamp(
             steering,
