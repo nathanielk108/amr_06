@@ -1,24 +1,16 @@
 #include <cmath>
-#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <algorithm>
 #include <limits>
 
-#include <rclcpp/create_timer.hpp>
-#include <rclcpp/executors.hpp>
-#include <rclcpp/executors/single_threaded_executor.hpp>
-#include <rclcpp/publisher_base.hpp>
-#include <rclcpp/qos.hpp>
-#include <rclcpp/subscription.hpp>
-#include <rclcpp/utilities.hpp>
+#include <rclcpp/rclcpp.hpp>
 
 #include <rmw/qos_profiles.h>
-#include <sensor_msgs/msg/joy.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/twist.hpp>
-#include <irobot_create_msgs/msg/ir_intensity_vector.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
 
 using namespace std::chrono_literals;
 using namespace std::placeholders;
@@ -26,34 +18,30 @@ using namespace std::placeholders;
 using namespace sensor_msgs::msg;
 using namespace geometry_msgs::msg;
 using namespace nav_msgs::msg;
-using namespace irobot_create_msgs::msg;
 
 class Lab3Node : public rclcpp::Node {
 
 private:
-  // Timers
   rclcpp::TimerBase::SharedPtr timer_;
 
-  // Subscriptions
-  rclcpp::Subscription<Joy>::SharedPtr sub_joy_;
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
   rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
 
-  // Publishers
   rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
 
-  // Vehicle State
   Vector3 pos_;
-  Vector3 vel_;
   Vector3 goal_;
 
   double current_angle_ = 0.0;
 
-  double laser_steering_ = 0.0;
-  double obstacle_strength_ = 0.0;
-  double closest_obstacle_ = std::numeric_limits<double>::infinity();
+  double front_ = 10.0;
+  double left_ = 10.0;
+  double right_ = 10.0;
 
   bool goal_initialized_ = false;
+
+  // Change to 0 if lidar angle 0 already points forward.
+  double lidar_offset_ = M_PI / 2.0;
 
 public:
   explicit Lab3Node() : rclcpp::Node("lab3_node") {
@@ -75,19 +63,14 @@ public:
             rmw_qos_profile_sensor_data),
         std::bind(&Lab3Node::laser_scan_callback, this, _1));
 
-    pub_twist_ = this->create_publisher<Twist>("/TTB06/cmd_vel", 10);
+    pub_twist_ = this->create_publisher<Twist>(
+        "/TTB06/cmd_vel", 10);
 
-    pos_.x = 0;
-    pos_.y = 0;
-    pos_.z = 0;
+    pos_.x = 0.0;
+    pos_.y = 0.0;
 
-    vel_.x = 0;
-    vel_.y = 0;
-    vel_.z = 0;
-
-    goal_.x = 0;
-    goal_.y = 0;
-    goal_.z = 0;
+    goal_.x = 0.0;
+    goal_.y = 0.0;
   }
 
   void command_loop_function() {
@@ -96,42 +79,60 @@ public:
       return;
     }
 
-    double kg = 0.4;
-    double ka = 2.0;
-
     double distance =
-        std::hypot(goal_.x - pos_.x, goal_.y - pos_.y);
+        std::hypot(goal_.x - pos_.x,
+                   goal_.y - pos_.y);
 
-    double desiredHeading =
-        std::atan2(goal_.y - pos_.y, goal_.x - pos_.x);
+    double desired_heading =
+        std::atan2(goal_.y - pos_.y,
+                   goal_.x - pos_.x);
 
-    double headingError =
+    double heading_error =
         std::atan2(
-            std::sin(desiredHeading - current_angle_),
-            std::cos(desiredHeading - current_angle_));
+            std::sin(desired_heading - current_angle_),
+            std::cos(desired_heading - current_angle_));
 
-    double goalSteering = kg * headingError;
-    double obstacleSteering = ka * laser_steering_;
+    double speed = 0.2;
+    double steering = 0.8 * heading_error;
 
-    double steering = goalSteering + obstacleSteering;
+    // Obstacle ahead
+    if (front_ < 0.65) {
+
+      speed = 0.08;
+
+      // Turn toward the side with more space
+      if (left_ > right_) {
+        steering = 0.8;
+      }
+      else {
+        steering = -0.8;
+      }
+    }
+
+    // Very close obstacle
+    if (front_ < 0.30) {
+
+      speed = 0.0;
+
+      if (left_ > right_) {
+        steering = 1.0;
+      }
+      else {
+        steering = -1.0;
+      }
+    }
 
     steering = std::clamp(steering, -1.0, 1.0);
-
-    // Slow down as obstacle strength increases
-    double speed =
-        0.2 * (1.0 - 0.9 * obstacle_strength_);
-
-    speed = std::clamp(speed, 0.02, 0.2);
 
     Twist cmd;
 
     if (distance < 0.05) {
-      cmd.linear.set__x(0.0);
-      cmd.angular.set__z(0.0);
+      cmd.linear.x = 0.0;
+      cmd.angular.z = 0.0;
     }
     else {
-      cmd.linear.set__x(speed);
-      cmd.angular.set__z(steering);
+      cmd.linear.x = speed;
+      cmd.angular.z = steering;
     }
 
     pub_twist_->publish(cmd);
@@ -140,41 +141,31 @@ public:
         this->get_logger(),
         *this->get_clock(),
         500,
-        "pos=(%.2f, %.2f) goal=(%.2f, %.2f) dist=%.2f heading_err=%.2f goal_turn=%.2f avoid_turn=%.2f obstacle=%.2f closest=%.2f -> v=%.2f w=%.2f",
-        pos_.x,
-        pos_.y,
-        goal_.x,
-        goal_.y,
+        "dist=%.2f front=%.2f left=%.2f right=%.2f v=%.2f w=%.2f",
         distance,
-        headingError,
-        goalSteering,
-        obstacleSteering,
-        obstacle_strength_,
-        closest_obstacle_,
+        front_,
+        left_,
+        right_,
         cmd.linear.x,
         cmd.angular.z);
   }
 
   void odometry_callback(const Odometry &msg) {
 
-    // Global Frame
     pos_.x = msg.pose.pose.position.x;
     pos_.y = msg.pose.pose.position.y;
 
-    vel_.x = msg.twist.twist.linear.x;
-    vel_.y = msg.twist.twist.linear.y;
-
-    // Robot Frame
     double qx = msg.pose.pose.orientation.x;
     double qy = msg.pose.pose.orientation.y;
     double qz = msg.pose.pose.orientation.z;
     double qw = msg.pose.pose.orientation.w;
 
-    current_angle_ = std::atan2(
-        2.0 * (qw * qz + qx * qy),
-        1.0 - 2.0 * (qy * qy + qz * qz));
+    current_angle_ =
+        std::atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz));
 
-    // Set goal 1.5 m in the direction the robot starts facing
+    // Goal is 1.5 meters in front of starting pose
     if (!goal_initialized_) {
 
       goal_.x =
@@ -187,7 +178,7 @@ public:
 
       RCLCPP_INFO(
           this->get_logger(),
-          "Start=(%.2f, %.2f) heading=%.2f rad goal=(%.2f, %.2f)",
+          "Start=(%.2f, %.2f) heading=%.2f goal=(%.2f, %.2f)",
           pos_.x,
           pos_.y,
           current_angle_,
@@ -198,106 +189,52 @@ public:
 
   void laser_scan_callback(const LaserScan &msg) {
 
-    double obstacle_range = 1.5;
-
-    double steering_sum = 0.0;
-    double strength_sum = 0.0;
-
-    laser_steering_ = 0.0;
-    obstacle_strength_ = 0.0;
-    closest_obstacle_ =
-        std::numeric_limits<double>::infinity();
-
-    int forward_count = 0;
-    int obstacle_count = 0;
+    front_ = 10.0;
+    left_ = 10.0;
+    right_ = 10.0;
 
     for (size_t i = 0; i < msg.ranges.size(); ++i) {
 
-      double range = msg.ranges.at(i);
-
-      double angle =
-          msg.angle_min +
-          (msg.angle_increment * i);
-
-      // Normalize scan angle to [-pi, pi]
-      angle =
-          std::atan2(std::sin(angle), std::cos(angle));
+      double range = msg.ranges[i];
 
       if (!std::isfinite(range)) {
         continue;
       }
 
-      // Only use forward-facing 180 degrees
-      if (std::abs(angle) > M_PI / 2.0) {
+      if (range < msg.range_min ||
+          range > msg.range_max) {
         continue;
       }
 
-      forward_count++;
+      double angle =
+          msg.angle_min +
+          msg.angle_increment * i;
 
-      // Only obstacles inside influence range matter
-      if (range <= msg.range_min ||
-          range > obstacle_range) {
-        continue;
+      // Convert lidar frame to robot-forward frame
+      angle += lidar_offset_;
+
+      angle =
+          std::atan2(
+              std::sin(angle),
+              std::cos(angle));
+
+      // Front: +/- 30 degrees
+      if (std::abs(angle) < M_PI / 6.0) {
+        front_ = std::min(front_, range);
       }
 
-      obstacle_count++;
+      // Left: 30 to 90 degrees
+      else if (angle >= M_PI / 6.0 &&
+               angle < M_PI / 2.0) {
+        left_ = std::min(left_, range);
+      }
 
-      double strength =
-          (obstacle_range - range) /
-          obstacle_range;
-
-      /*
-       * Obstacle on left:
-       * angle > 0
-       * steering contribution < 0
-       *
-       * Obstacle on right:
-       * angle < 0
-       * steering contribution > 0
-       */
-      steering_sum +=
-          -strength * std::sin(angle);
-
-      strength_sum += strength;
-
-      obstacle_strength_ =
-          std::max(
-              obstacle_strength_,
-              strength);
-
-      closest_obstacle_ =
-          std::min(
-              closest_obstacle_,
-              range);
+      // Right: -90 to -30 degrees
+      else if (angle <= -M_PI / 6.0 &&
+               angle > -M_PI / 2.0) {
+        right_ = std::min(right_, range);
+      }
     }
-
-    if (strength_sum > 0.0) {
-      laser_steering_ =
-          steering_sum / strength_sum;
-    }
-
-    /*
-     * A box directly in front can produce equal left and right
-     * repulsive forces. Give the robot a direction to break the
-     * symmetry instead of driving directly into the local minimum.
-     */
-    if (obstacle_strength_ > 0.2 &&
-        std::abs(laser_steering_) < 0.05) {
-
-      laser_steering_ = 0.5;
-    }
-
-    RCLCPP_INFO_THROTTLE(
-        this->get_logger(),
-        *this->get_clock(),
-        500,
-        "scan=%zu forward=%d obstacles=%d closest=%.2f strength=%.2f avoidance=%.2f",
-        msg.ranges.size(),
-        forward_count,
-        obstacle_count,
-        closest_obstacle_,
-        obstacle_strength_,
-        laser_steering_);
   }
 };
 
@@ -308,7 +245,7 @@ int main(int argc, char **argv) {
   Lab3Node::SharedPtr control_node =
       std::make_shared<Lab3Node>();
 
-  rclcpp::executors::SingleThreadedExecutor exec{};
+  rclcpp::executors::SingleThreadedExecutor exec;
 
   exec.add_node(control_node);
   exec.spin();
