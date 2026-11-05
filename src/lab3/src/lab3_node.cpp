@@ -3,8 +3,8 @@
 #include <functional>
 #include <memory>
 #include <algorithm>
+#include <limits>
 
-#include <rclcpp/rclcpp.hpp>
 #include <rclcpp/create_timer.hpp>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
@@ -14,10 +14,11 @@
 #include <rclcpp/utilities.hpp>
 
 #include <rmw/qos_profiles.h>
+#include <sensor_msgs/msg/joy.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/twist.hpp>
-
+#include <irobot_create_msgs/msg/ir_intensity_vector.hpp>
 
 using namespace std::chrono_literals;
 using namespace std::placeholders;
@@ -25,6 +26,7 @@ using namespace std::placeholders;
 using namespace sensor_msgs::msg;
 using namespace geometry_msgs::msg;
 using namespace nav_msgs::msg;
+using namespace irobot_create_msgs::msg;
 
 class Lab3Node : public rclcpp::Node {
 
@@ -33,6 +35,7 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 
   // Subscriptions
+  rclcpp::Subscription<Joy>::SharedPtr sub_joy_;
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
   rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
 
@@ -45,21 +48,9 @@ private:
   Vector3 goal_;
 
   double current_angle_ = 0.0;
-  double last_angle_ = 0.0;
   double laser_steering_ = 0.0;
-  double min_obstacle_dist_ = 100.0;
-  double robot_radius_ = 0.2; 
-  double max_range_ = 3.0;   
-  double goal_tolerance_ = 0.10;  
-  bool goal_rendered_ = false;
-
-  double max_vel = 0.5;
-  double max_ang_vel = M_PI/4;
-
-  double origin_x_ = 0.0;
-  double origin_y_ = 0.0;
-  double origin_yaw_ = 0.0;
-  bool origin_rendered_ = false;
+  double obstacle_strength_ = 0.0;
+  double closest_obstacle_ = std::numeric_limits<double>::infinity();
 
 public:
   explicit Lab3Node() : rclcpp::Node("lab3_node") {
@@ -85,24 +76,52 @@ public:
 
     pos_.x = 0;
     pos_.y = 0;
+    pos_.z = 0;
+
     goal_.x = 1.5;
     goal_.y = 0;
   }
 
   void command_loop_function() {
-    Twist cmd;
     double kg = 0.5;
-    double ka = 0.1;
+    double ka = 0.5;
+
     double distance = std::hypot(goal_.x - pos_.x, goal_.y - pos_.y);
-    if (distance > goal_tolerance_) {
-      double goal_heading = std::atan2(goal_.y - pos_.y, goal_.x - pos_.x);
-      double heading_error = std::atan2(std::sin(goal_heading - current_angle_), std::cos(goal_heading - current_angle_));
-      double steering = (kg * heading_error) + (ka * laser_steering_);
-    
-      cmd.linear.set__x(0.5);
+    double desiredHeading = std::atan2(goal_.y - pos_.y, goal_.x - pos_.x);
+    double headingError = std::atan2(std::sin(desiredHeading - current_angle_), std::cos(desiredHeading - current_angle_));
+
+    double steering = (kg * headingError) + (ka * laser_steering_);
+
+    steering = std::clamp(steering, -1.0, 1.0);
+
+    double speed = 0.2 * (1.0 - 0.8 * obstacle_strength_);
+    speed = std::clamp(speed, 0.04, 0.2);
+
+    Twist cmd;
+
+    if (distance < 0.05) {
+      cmd.linear.set__x(0.0);
+      cmd.angular.set__z(0.0);
+    } else {
+      cmd.linear.set__x(speed);
       cmd.angular.set__z(steering);
     }
+
     pub_twist_->publish(cmd);
+
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        500,
+        "pos=(%.2f, %.2f) dist=%.2f head_err=%.2f obstacle=%.2f closest=%.2f speed=%.2f steer=%.2f",
+        pos_.x,
+        pos_.y,
+        distance,
+        headingError,
+        obstacle_strength_,
+        closest_obstacle_,
+        cmd.linear.x,
+        cmd.angular.z);
   }
 
   void odometry_callback(const Odometry &msg) {
@@ -118,48 +137,66 @@ public:
     double qy = msg.pose.pose.orientation.y;
     double qz = msg.pose.pose.orientation.z;
     double qw = msg.pose.pose.orientation.w;
-    current_angle_ = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)); // quarternion yaw angle
 
-    if (!origin_rendered_) {
-      origin_x_ = pos_.x;
-      origin_y_ = pos_.y;
-      origin_yaw_ = current_angle_;
-      origin_rendered_ = true;
-    }
-    
-    double dx = pos_.x - origin_x_;
-    double dy = pos_.y - origin_y_;
-    pos_.x = dx * std::cos(origin_yaw_) + dy * std::sin(origin_yaw_);
-    pos_.y = -dx * std::sin(origin_yaw_) + dy * std::cos(origin_yaw_);
-    current_angle_ = std::atan2(std::sin(current_angle_ - origin_yaw_), std::cos(current_angle_ - origin_yaw_));
-
+    current_angle_ = std::atan2(
+        2.0 * (qw * qz + qx * qy),
+        1.0 - 2.0 * (qy * qy + qz * qz));
   }
 
   void laser_scan_callback(const LaserScan &msg) {
+    double obstacle_range = 0.8;
 
-    double goal_heading = std::atan2(goal_.y - pos_.y, goal_.x - pos_.x);
-    double heading_error = std::atan2(std::sin(goal_heading - current_angle_), std::cos(goal_heading - current_angle_));
+    double repulsive_x = 0.0;
+    double repulsive_y = 0.0;
 
-    double max_dist = -1.0;
-    double free_space_heading = heading_error;
+    laser_steering_ = 0.0;
+    obstacle_strength_ = 0.0;
+    closest_obstacle_ = std::numeric_limits<double>::infinity();
 
     for (size_t i = 0; i < msg.ranges.size(); ++i) {
       double range = msg.ranges.at(i);
-      if (range > max_range_) {
-        range = max_range_;
-      }
-      double d_i = std::max(0.001, range - robot_radius_);
       double angle = msg.angle_min + (msg.angle_increment * i);
-      angle = std::atan2(std::sin(angle), std::cos(angle));
-      if (d_i > max_dist) {
-        max_dist = d_i;
-        free_space_heading = angle;
+
+      // Only use valid forward-facing measurements
+      if (!std::isfinite(range)) {
+        continue;
       }
+
+      // Disregard angles outside forward 180 degrees
+      if (std::abs(angle) > M_PI / 2.0) {
+        continue;
+      }
+
+      if (range <= 0.0 || range > obstacle_range) {
+        continue;
+      }
+
+      double strength = (obstacle_range - range) / obstacle_range;
+
+      // Reverse the measured obstacle vector
+      repulsive_x -= strength * std::cos(angle);
+      repulsive_y -= strength * std::sin(angle);
+
+      obstacle_strength_ = std::max(obstacle_strength_, strength);
+      closest_obstacle_ = std::min(closest_obstacle_, range);
     }
-    laser_steering_ = free_space_heading;
+
+    if (obstacle_strength_ > 0.0) {
+      laser_steering_ = obstacle_strength_ * std::atan2(repulsive_y, repulsive_x);
+    }
+
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        500,
+        "laser: strength=%.2f closest=%.2f repulse=(%.2f, %.2f) avoidance=%.2f",
+        obstacle_strength_,
+        closest_obstacle_,
+        repulsive_x,
+        repulsive_y,
+        laser_steering_);
   }
 };
-
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
