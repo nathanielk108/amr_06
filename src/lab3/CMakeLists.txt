@@ -26,11 +26,11 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(lab3_node src/lab3_node.cpp)
-add_executable(lab3_node_sector src/lab3_node_sector.cpp)
+add_executable(lab3_node_sim src/lab3_node_sim.cpp)
 ament_target_dependencies(lab3_node rclcpp sensor_msgs geometry_msgs nav_msgs irobot_create_msgs)
-ament_target_dependencies(lab3_node_sector rclcpp sensor_msgs geometry_msgs nav_msgs irobot_create_msgs)
+ament_target_dependencies(lab3_node_sim rclcpp sensor_msgs geometry_msgs nav_msgs irobot_create_msgs)
 
-install(TARGETS lab3_node
+install(TARGETS lab3_node lab3_node_sim
         DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
