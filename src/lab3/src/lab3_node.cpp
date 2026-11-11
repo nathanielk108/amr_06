@@ -1,4 +1,9 @@
 #include <cmath>
+<<<<<<< HEAD
+=======
+#include <chrono>
+#include <cstddef>
+>>>>>>> c78a4fd (lidar and odom diagnostics)
 #include <cstdlib>
 #include <ctime>
 #include <functional>
@@ -59,6 +64,14 @@ private:
 
   // LiDAR Scan Data
   LaserScan latest_scan_;
+<<<<<<< HEAD
+=======
+  std::chrono::steady_clock::time_point last_odom_time_{};
+  std::chrono::steady_clock::time_point last_scan_time_{};
+  const std::chrono::milliseconds sensor_timeout_{1000};
+  bool logged_first_odom_ = false;
+  bool logged_first_scan_ = false;
+>>>>>>> c78a4fd (lidar and odom diagnostics)
 
   // Physical & Safety Parameters
   double robot_radius_ = 0.20;           // Disk abstraction radius (m)
@@ -81,6 +94,26 @@ private:
   double last_progress_x_ = 0.0;
   double last_progress_y_ = 0.0;
 
+<<<<<<< HEAD
+=======
+  const char *state_name() const {
+    switch (state_) {
+      case RobotState::NAVIGATING: return "NAVIGATING";
+      case RobotState::RECOVERY_ROTATE: return "RECOVERY_ROTATE";
+      case RobotState::RECOVERY_FORWARD: return "RECOVERY_FORWARD";
+    }
+    return "UNKNOWN";
+  }
+
+  void publish_command(const Twist &cmd, const char *reason) {
+    pub_twist_->publish(cmd);
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "CMD [%s/%s] linear=%.3f angular=%.3f; pos=(%.2f,%.2f)",
+        state_name(), reason, cmd.linear.x, cmd.angular.z, pos_.x, pos_.y);
+  }
+
+>>>>>>> c78a4fd (lidar and odom diagnostics)
   double wrap(double angle) {
     return std::atan2(std::sin(angle), std::cos(angle));
   }
@@ -114,18 +147,84 @@ public:
     pos_.y = 0.0;
     goal_.x = 1.5;
     goal_.y = 0.0;
+    RCLCPP_INFO(this->get_logger(),
+        "Lab3 controller started; subscribing /TTB06/odom and /TTB06/scan, publishing /TTB06/cmd_vel");
   }
 
 private:
   void command_loop_function() {
+<<<<<<< HEAD
     Twist cmd;
+=======
+    Twist cmd;  // Initialized to zero (safe stop).
+    if (!odom_received_ || !scan_received_) {
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "Waiting for callbacks: odom=%d scan=%d", odom_received_, scan_received_);
+      publish_command(cmd, "waiting_for_callbacks");
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto odom_age = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_odom_time_).count();
+    const auto scan_age = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_scan_time_).count();
+    if (odom_age > sensor_timeout_.count() || scan_age > sensor_timeout_.count()) {
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "Stale sensors: odom_age=%ldms scan_age=%ldms (limit=%ldms)",
+          static_cast<long>(odom_age), static_cast<long>(scan_age),
+          static_cast<long>(sensor_timeout_.count()));
+      publish_command(cmd, "stale_sensor_stop");
+      return;
+    }
+
+    if (latest_scan_.ranges.empty() ||
+        !std::isfinite(latest_scan_.angle_min) ||
+        !std::isfinite(latest_scan_.angle_increment) ||
+        latest_scan_.angle_increment == 0.0 ||
+        !std::isfinite(latest_scan_.range_min) ||
+        !std::isfinite(latest_scan_.range_max) ||
+        latest_scan_.range_max <= latest_scan_.range_min) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "Invalid LiDAR metadata or empty scan (samples=%zu)", latest_scan_.ranges.size());
+      publish_command(cmd, "invalid_scan_stop");
+      return;
+    }
+
+    size_t usable_rays = 0;
+    size_t finite_rays = 0;
+    size_t infinite_open_rays = 0;
+    for (const float r : latest_scan_.ranges) {
+      if (std::isfinite(r) && r >= latest_scan_.range_min && r <= latest_scan_.range_max) {
+        ++usable_rays;
+        ++finite_rays;
+      } else if (std::isinf(r) && r > 0.0f) {
+        ++usable_rays;
+        ++infinite_open_rays;
+      }
+    }
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "SCAN total=%zu finite=%zu +inf=%zu usable=%zu angles=[%.2f,%.2f] increment=%.5f",
+        latest_scan_.ranges.size(), finite_rays, infinite_open_rays, usable_rays,
+        latest_scan_.angle_min, latest_scan_.angle_max, latest_scan_.angle_increment);
+    if (usable_rays == 0) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "No usable LiDAR rays; stopping rather than entering blind recovery");
+      publish_command(cmd, "no_usable_scan_stop");
+      return;
+    }
+>>>>>>> c78a4fd (lidar and odom diagnostics)
     double dist_to_goal = std::hypot(goal_.x - pos_.x, goal_.y - pos_.y);
 
     // 1. Goal Reached Check
     if (dist_to_goal <= goal_tolerance_) {
       cmd.linear.x = 0.0;
       cmd.angular.z = 0.0;
+<<<<<<< HEAD
       pub_twist_->publish(cmd);
+=======
+      publish_command(cmd, "goal_reached");
+>>>>>>> c78a4fd (lidar and odom diagnostics)
       RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Goal Target Reached!");
       return;
     }
@@ -145,7 +244,11 @@ private:
         RCLCPP_INFO(this->get_logger(), "Safe corridor found (%.2fm). Driving forward 0.5m.", forward_clearance);
       }
 
+<<<<<<< HEAD
       pub_twist_->publish(cmd);
+=======
+      publish_command(cmd, "recovery");
+>>>>>>> c78a4fd (lidar and odom diagnostics)
       return;
     }
 
@@ -159,6 +262,10 @@ private:
 
       // Resume normal navigation once 0.5m is traversed or if an immediate obstacle blocks front
       if (dist_traveled >= 0.50 || forward_clearance < min_safe_distance_) {
+<<<<<<< HEAD
+=======
+        cmd.linear.x = 0.0;  // Do not drive forward on the terminating cycle.
+>>>>>>> c78a4fd (lidar and odom diagnostics)
         state_ = RobotState::NAVIGATING;
         stuck_ticks_ = 0;
         last_progress_x_ = pos_.x;
@@ -166,7 +273,11 @@ private:
         RCLCPP_INFO(this->get_logger(), "Recovery escape completed. Resuming navigation.");
       }
 
+<<<<<<< HEAD
       pub_twist_->publish(cmd);
+=======
+      publish_command(cmd, "recovery");
+>>>>>>> c78a4fd (lidar and odom diagnostics)
       return;
     }
 
@@ -186,6 +297,10 @@ private:
       recovery_spin_dir_ = (std::rand() % 2 == 0) ? 1 : -1;
       stuck_ticks_ = 0;
       RCLCPP_WARN(this->get_logger(), "Stuck in trap/oscillation! Initiating spin recovery.");
+<<<<<<< HEAD
+=======
+      publish_command(cmd, "entering_stuck_recovery_stop");
+>>>>>>> c78a4fd (lidar and odom diagnostics)
       return;
     }
 
@@ -204,12 +319,25 @@ private:
     for (size_t i = 0; i < latest_scan_.ranges.size(); ++i) {
       double r = latest_scan_.ranges[i];
 
+<<<<<<< HEAD
       if (std::isnan(r) || std::isinf(r) || r < latest_scan_.range_min) {
+=======
+      // +inf means no return within LiDAR range on many drivers.
+      // NaN, -inf, and out-of-range finite values are not safe-path evidence.
+      if (!(std::isfinite(r) && r >= latest_scan_.range_min && r <= latest_scan_.range_max) &&
+          !(std::isinf(r) && r > 0.0)) {
+>>>>>>> c78a4fd (lidar and odom diagnostics)
         continue;
       }
 
       double angle = wrap(latest_scan_.angle_min + static_cast<double>(i) * latest_scan_.angle_increment);
+<<<<<<< HEAD
       double r_clamped = std::clamp(r, 0.0, max_lidar_range_);
+=======
+      double r_clamped = (std::isinf(r) && r > 0.0)
+          ? std::min(latest_scan_.range_max, max_lidar_range_)
+          : std::clamp(r, 0.0, max_lidar_range_);
+>>>>>>> c78a4fd (lidar and odom diagnostics)
 
       // Reject rays within 10cm buffer beyond disk abstraction (0.30 m)
       if (r_clamped < min_safe_distance_) {
@@ -235,6 +363,10 @@ private:
       recovery_spin_dir_ = (std::rand() % 2 == 0) ? 1 : -1;
       stuck_ticks_ = 0;
       RCLCPP_WARN(this->get_logger(), "No safe paths (>30cm) found. Entering recovery spin.");
+<<<<<<< HEAD
+=======
+      publish_command(cmd, "entering_no_safe_ray_recovery_stop");
+>>>>>>> c78a4fd (lidar and odom diagnostics)
       return;
     }
 
@@ -245,6 +377,7 @@ private:
     cmd.linear.x = max_vel_ * alignment_factor;
     cmd.angular.z = std::clamp(steering, -max_ang_vel_, max_ang_vel_);
 
+<<<<<<< HEAD
     pub_twist_->publish(cmd);
   }
 
@@ -267,6 +400,30 @@ private:
       }
     }
     return min_front;
+=======
+    publish_command(cmd, "normal_navigation");
+  }
+
+  double get_forward_clearance() {
+    // Unknown coverage must not be treated as infinite free space.
+    double min_front = std::numeric_limits<double>::infinity();
+    bool saw_usable_front_ray = false;
+    for (size_t i = 0; i < latest_scan_.ranges.size(); ++i) {
+      const double r = latest_scan_.ranges[i];
+      const double angle = wrap(latest_scan_.angle_min +
+          static_cast<double>(i) * latest_scan_.angle_increment);
+      if (std::abs(angle) > (M_PI / 6.0)) continue;
+
+      if (std::isfinite(r) && r >= latest_scan_.range_min && r <= latest_scan_.range_max) {
+        min_front = std::min(min_front, r);
+        saw_usable_front_ray = true;
+      } else if (std::isinf(r) && r > 0.0) {
+        min_front = std::min(min_front, static_cast<double>(latest_scan_.range_max));
+        saw_usable_front_ray = true;
+      }
+    }
+    return saw_usable_front_ray ? min_front : 0.0;
+>>>>>>> c78a4fd (lidar and odom diagnostics)
   }
 
   void odometry_callback(const Odometry &msg) {
@@ -296,11 +453,25 @@ private:
     current_angle_ = wrap(raw_yaw - origin_yaw_);
 
     odom_received_ = true;
+    last_odom_time_ = std::chrono::steady_clock::now();
+    if (!logged_first_odom_) {
+      RCLCPP_INFO(this->get_logger(), "First odometry callback received; origin initialized");
+      logged_first_odom_ = true;
+    }
   }
 
   void laser_scan_callback(const LaserScan &msg) {
     latest_scan_ = msg;
     scan_received_ = true;
+<<<<<<< HEAD
+=======
+    last_scan_time_ = std::chrono::steady_clock::now();
+    if (!logged_first_scan_) {
+      RCLCPP_INFO(this->get_logger(), "First LiDAR callback received: %zu samples, frame=%s",
+                  msg.ranges.size(), msg.header.frame_id.c_str());
+      logged_first_scan_ = true;
+    }
+>>>>>>> c78a4fd (lidar and odom diagnostics)
   }
 };
 
