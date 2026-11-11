@@ -39,14 +39,14 @@ private:
   bool scan_received_ = false;
 
   /*
-   * Filtered APF repulsive vector in robot frame.
+   * Filtered repulsive field in robot coordinates.
    */
   double repulsive_x_ = 0.0;
   double repulsive_y_ = 0.0;
 
   /*
-   * Obstacle clearances measured from the robot safety
-   * boundary rather than directly from the lidar.
+   * Obstacle clearances measured from the robot's
+   * safety boundary.
    */
   double closest_front_ =
       std::numeric_limits<double>::infinity();
@@ -55,8 +55,7 @@ private:
       std::numeric_limits<double>::infinity();
 
   /*
-   * Average free space on each side of the robot.
-   * Used only to choose an avoidance direction.
+   * Average free space to either side.
    */
   double left_space_ = 0.0;
   double right_space_ = 0.0;
@@ -69,7 +68,7 @@ private:
   int avoidance_side_ = 0;
 
   /*
-   * Filtered velocity commands.
+   * Smoothed velocity commands.
    */
   double steering_command_ = 0.0;
   double speed_command_ = 0.0;
@@ -82,7 +81,7 @@ public:
      * Example:
      *
      * ros2 run lab3 lab3_node \
-     *     --ros-args -p goal_distance:=4.0
+     *   --ros-args -p goal_distance:=4.0
      */
     this->declare_parameter<double>(
         "goal_distance",
@@ -140,7 +139,7 @@ public:
 
     /*
      * --------------------------------------------------
-     * Goal position relative to robot
+     * Goal relative to robot
      * --------------------------------------------------
      */
 
@@ -155,6 +154,9 @@ public:
             goal_dx,
             goal_dy);
 
+    /*
+     * Stop at goal.
+     */
     if (distance < 0.05) {
 
       speed_command_ = 0.0;
@@ -182,12 +184,9 @@ public:
      * --------------------------------------------------
      * Attractive field
      * --------------------------------------------------
-     *
-     * Attractive magnitude is capped so repulsion can
-     * still influence the robot far from the goal.
      */
 
-    double attractive_gain = 1.0;
+    const double attractive_gain = 1.0;
 
     double attractive_magnitude =
         attractive_gain *
@@ -207,24 +206,30 @@ public:
 
     /*
      * --------------------------------------------------
-     * Determine whether center path is blocked
+     * Blocked-path detection
      * --------------------------------------------------
+     *
+     * Use both the center sector and wider forward
+     * sector. This prevents an angled wall from being
+     * ignored because it lies just outside the center.
      */
 
-    const double block_distance = 0.35;
-    const double release_distance = 0.55;
+    const double center_block_distance = 0.55;
+    const double front_block_distance = 0.40;
+    const double release_distance = 0.75;
+
+    bool path_blocked =
+        closest_center_ <
+            center_block_distance ||
+        closest_front_ <
+            front_block_distance;
 
     /*
-     * Enter avoidance only when something is actually
-     * blocking the narrow center sector.
+     * Choose an avoidance side once.
      */
     if (avoidance_side_ == 0 &&
-        closest_center_ <
-            block_distance) {
+        path_blocked) {
 
-      /*
-       * Choose whichever side has more free space.
-       */
       if (left_space_ >
           right_space_ + 0.05) {
 
@@ -239,27 +244,32 @@ public:
       } else {
 
         /*
-         * If both sides are about equal, use the
-         * repulsive field to break the tie.
+         * If both sides are about equally open,
+         * use the repulsive field to break the tie.
          */
-        if (repulsive_y_ < 0.0) {
-          avoidance_side_ = -1;
-        } else {
+        if (repulsive_y_ >= 0.0) {
           avoidance_side_ = 1;
+        } else {
+          avoidance_side_ = -1;
         }
       }
     }
 
     /*
-     * Keep the chosen direction until the center path
-     * is clearly open again.
+     * Keep the chosen side until both the center and
+     * wider forward area are clearly open.
      */
     if (avoidance_side_ != 0 &&
         closest_center_ >
+            release_distance &&
+        closest_front_ >
             release_distance) {
 
       avoidance_side_ = 0;
     }
+
+    bool avoiding =
+        avoidance_side_ != 0;
 
     /*
      * --------------------------------------------------
@@ -269,25 +279,23 @@ public:
 
     double desired_heading = 0.0;
 
-    bool blocked =
-        avoidance_side_ != 0;
-
     bool goal_behind =
         std::abs(
             relative_goal_angle) >
-        85.0 * M_PI / 180.0;
+        85.0 *
+        M_PI /
+        180.0;
 
-    if (blocked) {
+    if (avoiding) {
 
       /*
-       * Explicit blocked-path behavior.
+       * A blocked path gets an explicit strong turn.
        *
-       * Do not let a nearly symmetric APF decide to
-       * oscillate around zero degrees. Turn decisively
-       * toward the selected open side.
+       * This avoids the local minimum where a centered
+       * obstacle produces almost no lateral APF force.
        */
-      double avoid_angle =
-          55.0 *
+      const double avoid_angle =
+          65.0 *
           M_PI /
           180.0;
 
@@ -298,11 +306,10 @@ public:
     } else if (goal_behind) {
 
       /*
-       * If an earlier avoidance maneuver caused the
-       * robot to rotate too far, deliberately point
-       * back toward the goal before moving again.
+       * If the robot has rotated too far, point back
+       * toward the goal before translating.
        */
-      double recovery_angle =
+      const double recovery_angle =
           60.0 *
           M_PI /
           180.0;
@@ -332,11 +339,10 @@ public:
               field_x);
 
       /*
-       * Normal APF motion is restricted to the forward
-       * hemisphere. This prevents a close obstacle from
-       * telling the robot to completely turn around.
+       * Normal APF should not command a complete
+       * reversal.
        */
-      double max_heading =
+      const double max_heading =
           60.0 *
           M_PI /
           180.0;
@@ -354,7 +360,7 @@ public:
      * --------------------------------------------------
      */
 
-    double turn_gain = 1.5;
+    const double turn_gain = 1.5;
 
     double steering_target =
         turn_gain *
@@ -367,9 +373,9 @@ public:
             0.9);
 
     /*
-     * Smooth steering without making it overly sluggish.
+     * Smooth scan-to-scan steering changes.
      */
-    double steering_alpha = 0.45;
+    const double steering_alpha = 0.45;
 
     steering_command_ =
         steering_alpha *
@@ -393,46 +399,52 @@ public:
 
     const double max_speed = 0.15;
 
-    const double stop_distance = 0.12;
-    const double slow_distance = 0.60;
+    const double emergency_stop_distance = 0.25;
+    const double slow_distance = 0.75;
 
     double speed_target =
         max_speed;
 
     /*
      * Goal behind:
-     * rotate first.
+     * rotate back toward it before moving.
      */
     if (goal_behind &&
-        !blocked) {
+        !avoiding) {
 
       speed_target = 0.0;
 
     /*
-     * Center blocked:
-     * turn in place when very close, otherwise creep
-     * forward while turning so the geometry changes.
+     * Explicit obstacle avoidance.
      */
-    } else if (blocked) {
+    } else if (avoiding) {
 
-      if (closest_center_ <
-          stop_distance) {
+      /*
+       * Very close obstacle:
+       * turn in place.
+       */
+      if (closest_front_ <
+          emergency_stop_distance) {
 
         speed_target = 0.0;
 
       } else {
 
+        /*
+         * Otherwise creep forward while turning.
+         * Translation helps change the geometry and
+         * prevents getting stuck rotating forever.
+         */
         speed_target = 0.025;
       }
 
     } else {
 
       /*
-       * Normal speed reduction based on the wider
-       * forward obstacle sector.
+       * Normal speed reduction from forward clearance.
        */
-      if (closest_front_ <=
-          stop_distance) {
+      if (closest_front_ <
+          emergency_stop_distance) {
 
         speed_target = 0.0;
 
@@ -442,9 +454,9 @@ public:
 
         double scale =
             (closest_front_ -
-             stop_distance) /
+             emergency_stop_distance) /
             (slow_distance -
-             stop_distance);
+             emergency_stop_distance);
 
         scale =
             std::clamp(
@@ -452,10 +464,6 @@ public:
                 0.0,
                 1.0);
 
-        /*
-         * Maintain some useful translation rather than
-         * collapsing almost immediately toward zero.
-         */
         speed_target =
             0.04 +
             scale *
@@ -464,7 +472,7 @@ public:
       }
 
       /*
-       * Large turns reduce speed but do not stop it.
+       * Slow down during substantial APF turns.
        */
       double abs_heading =
           std::abs(
@@ -494,9 +502,9 @@ public:
     }
 
     /*
-     * Smooth acceleration/deceleration.
+     * Smooth normal acceleration and deceleration.
      */
-    double speed_alpha = 0.40;
+    const double speed_alpha = 0.40;
 
     speed_command_ =
         speed_alpha *
@@ -506,10 +514,10 @@ public:
             speed_command_;
 
     /*
-     * Do not smooth through an emergency stop.
+     * Safety stop is immediate, not filtered.
      */
-    if (closest_center_ <
-        stop_distance) {
+    if (closest_front_ <
+        emergency_stop_distance) {
 
       speed_command_ = 0.0;
     }
@@ -539,6 +547,7 @@ public:
         "center=%.2f "
         "left=%.2f "
         "right=%.2f "
+        "blocked=%d "
         "side=%d "
         "heading=%.2f "
         "v=%.2f "
@@ -551,6 +560,7 @@ public:
         closest_center_,
         left_space_,
         right_space_,
+        path_blocked,
         avoidance_side_,
         desired_heading,
         cmd.linear.x,
@@ -578,6 +588,9 @@ public:
     double qw =
         msg.pose.pose.orientation.w;
 
+    /*
+     * Quaternion to yaw.
+     */
     current_angle_ =
         std::atan2(
             2.0 *
@@ -589,8 +602,8 @@ public:
                  qz * qz));
 
     /*
-     * Goal is created once, directly ahead of the
-     * initial odometry pose.
+     * Goal is placed goal_distance_ meters directly
+     * ahead of the initial odometry pose.
      */
     if (!goal_initialized_) {
 
@@ -629,50 +642,60 @@ public:
 
     /*
      * --------------------------------------------------
-     * Geometry and APF parameters
+     * Geometry
      * --------------------------------------------------
      */
 
     const double robot_radius = 0.18;
     const double safety_margin = 0.10;
 
-    const double influence_distance = 0.80;
+    /*
+     * Obstacle begins influencing APF when its clearance
+     * from the robot safety boundary is below 1 m.
+     */
+    const double influence_distance = 1.0;
+
     const double minimum_clearance = 0.05;
 
-    const double repulsive_gain = 0.05;
+    /*
+     * Stronger than the previous version because the
+     * repulsive sector is now correctly limited to
+     * obstacles in front of the robot.
+     */
+    const double repulsive_gain = 0.10;
 
     /*
-     * APF repulsion only considers obstacles roughly
-     * ahead of the robot.
+     * Only rays within +/-85 degrees contribute to
+     * repulsion.
      *
-     * A wall behind the robot must never create a
-     * forward-pointing "repulsive" force.
+     * cos(angle) is positive throughout this range, so
+     * every obstacle produces a non-positive X
+     * repulsive component.
      */
     const double repulsive_half_angle =
-        100.0 *
+        85.0 *
         M_PI /
         180.0;
 
     /*
-     * Wider sector used for speed control.
+     * Wider sector used for collision/speed control.
      */
     const double front_half_angle =
-        70.0 *
+        75.0 *
         M_PI /
         180.0;
 
     /*
-     * Narrow sector that determines whether the route
-     * directly ahead is blocked.
+     * Center sector used for blocked-path detection.
      */
     const double center_half_angle =
-        25.0 *
+        40.0 *
         M_PI /
         180.0;
 
     /*
-     * Side sectors used to determine which direction
-     * has more open space.
+     * Side sectors used to determine the more open
+     * avoidance direction.
      */
     const double side_inner_angle =
         20.0 *
@@ -703,7 +726,7 @@ public:
 
     /*
      * --------------------------------------------------
-     * Process scan
+     * Process lidar
      * --------------------------------------------------
      */
 
@@ -711,8 +734,55 @@ public:
          i < msg.ranges.size();
          ++i) {
 
+      double angle =
+          msg.angle_min +
+          msg.angle_increment *
+              static_cast<double>(i);
+
+      angle =
+          normalize_angle(
+              angle);
+
       double range =
           msg.ranges[i];
+
+      /*
+       * An infinite return means nothing was detected
+       * within the sensor range. For open-space scoring,
+       * treat that direction as open.
+       */
+      bool no_return =
+          std::isinf(range) &&
+          range > 0.0;
+
+      if (no_return) {
+
+        double open_space = 1.5;
+
+        if (angle >=
+                side_inner_angle &&
+            angle <=
+                side_outer_angle) {
+
+          left_sum +=
+              open_space;
+
+          ++left_count;
+        }
+
+        if (angle <=
+                -side_inner_angle &&
+            angle >=
+                -side_outer_angle) {
+
+          right_sum +=
+              open_space;
+
+          ++right_count;
+        }
+
+        continue;
+      }
 
       if (!std::isfinite(range)) {
         continue;
@@ -724,20 +794,8 @@ public:
       }
 
       /*
-       * Testing showed angle zero is already robot
-       * forward, so no lidar offset is applied.
-       */
-      double angle =
-          msg.angle_min +
-          msg.angle_increment *
-              static_cast<double>(i);
-
-      angle =
-          normalize_angle(
-              angle);
-
-      /*
-       * Clearance from our chosen safety boundary.
+       * No lidar angle offset is used.
+       * Testing showed angle zero is robot forward.
        */
       double clearance =
           range -
@@ -746,7 +804,7 @@ public:
 
       /*
        * ------------------------------------------------
-       * Clearance measurements
+       * Clearance sectors
        * ------------------------------------------------
        */
 
@@ -769,11 +827,11 @@ public:
       }
 
       /*
-       * Open-space scores.
-       *
-       * Clamp large values because we only care which
-       * side is locally more open.
+       * ------------------------------------------------
+       * Side openness
+       * ------------------------------------------------
        */
+
       double space =
           std::clamp(
               clearance,
@@ -804,11 +862,10 @@ public:
 
       /*
        * ------------------------------------------------
-       * Repulsive potential field
+       * APF repulsion
        * ------------------------------------------------
-       *
-       * Ignore obstacles behind the robot.
        */
+
       if (std::abs(angle) >
           repulsive_half_angle) {
         continue;
@@ -825,7 +882,7 @@ public:
               minimum_clearance);
 
       /*
-       * Standard APF repulsive field:
+       * Standard APF:
        *
        * eta * (1/rho - 1/rho0) / rho^2
        */
@@ -837,14 +894,14 @@ public:
           (rho * rho);
 
       /*
-       * Account for lidar angular resolution.
+       * Account for angular lidar resolution.
        */
       magnitude *=
           std::abs(
               msg.angle_increment);
 
       /*
-       * Ray points toward obstacle.
+       * Lidar ray points toward obstacle.
        * Repulsion points away.
        */
       raw_repulsive_x -=
@@ -860,7 +917,7 @@ public:
 
     /*
      * --------------------------------------------------
-     * Calculate side openness
+     * Side openness averages
      * --------------------------------------------------
      */
 
@@ -890,11 +947,11 @@ public:
 
     /*
      * --------------------------------------------------
-     * Limit and filter repulsive field
+     * Limit repulsive field
      * --------------------------------------------------
      */
 
-    const double max_repulsive = 1.5;
+    const double max_repulsive = 2.0;
 
     double repulsive_length =
         std::hypot(
@@ -916,9 +973,7 @@ public:
     }
 
     /*
-     * Filtering the resulting vector is much less
-     * expensive and simpler than filtering every
-     * individual lidar beam.
+     * Low-pass filter the resulting field.
      */
     const double repulsive_alpha = 0.30;
 
@@ -937,7 +992,7 @@ public:
             repulsive_y_;
 
     /*
-     * Remove insignificant filter residue.
+     * Remove tiny residual values.
      */
     if (std::hypot(
             repulsive_x_,
