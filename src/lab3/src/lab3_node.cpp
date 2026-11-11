@@ -61,15 +61,15 @@ private:
 
   double kg_ = 1.2;                  // Go-to-Goal heading gain
   double ka_ = 0.8;                  // Reactive obstacle steering gain
-  double max_vel_ = 0.25;            // Max linear speed (m/s)
-  double max_ang_vel_ = M_PI / 4.0;  // Max angular speed (rad/s)
+  double max_vel_ = 0.4;            // Max linear speed (m/s)
+  double max_ang_vel_ = M_PI / 2.0;  // Max angular speed (rad/s)
 
 public:
   explicit Lab3Node() : rclcpp::Node("lab3_node") {
 
-    // Main control loop running at 10 Hz (100 ms)
+    // Main control loop running at 100 Hz (10 ms)
     timer_ = this->create_wall_timer(
-        100ms, std::bind(&Lab3Node::command_loop_function, this));
+        10ms, std::bind(&Lab3Node::command_loop_function, this));
 
     // Subscriptions using sensor data QoS
     sub_odometry_ = this->create_subscription<Odometry>(
@@ -92,7 +92,7 @@ public:
     // Initial goal position relative to start frame
     pos_.x = 0.0;
     pos_.y = 0.0;
-    goal_.x = 1.5;
+    goal_.x = 10.0;
     goal_.y = 0.0;
   }
 
@@ -116,15 +116,14 @@ private:
 
     // 2. Go-To-Goal Heading Error Calculation
     double goal_heading = std::atan2(goal_.y - pos_.y, goal_.x - pos_.x);
-    double heading_error = std::atan2(std::sin(goal_heading - current_angle_),
-                                      std::cos(goal_heading - current_angle_));
+    double heading_error = std::atan2(std::sin(goal_heading - current_angle_), std::cos(goal_heading - current_angle_));
 
     double steering_cmd = 0.0;
 
     // 3. Reactive Obstacle Avoidance Logic (Lecture-Based Direct Nudge)
     if (min_obstacle_dist_ < obstacle_threshold_) {
-      // Turn away from the nearest obstacle (sign flipped)
-      double avoid_direction = (min_obstacle_angle_ >= 0.0) ? 1.0 : -1.0;
+      // Turn away from the nearest obstacle (opposite sign of obstacle angle)
+      double avoid_direction = (min_obstacle_angle_ >= 0.0) ? -1.0 : 1.0;
       double avoidance_steering = avoid_direction * (obstacle_threshold_ - min_obstacle_dist_);
 
       // Blend Go-To-Goal heading with Reactive Obstacle Avoidance Nudge
