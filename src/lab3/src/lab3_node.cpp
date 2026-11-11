@@ -1,1040 +1,381 @@
-#include <cmath>
-#include <functional>
-#include <memory>
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 
-#include <rclcpp/rclcpp.hpp>
-#include <rmw/qos_profiles.h>
-
-#include <sensor_msgs/msg/laser_scan.hpp>
-#include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/twist.hpp>
-#include <geometry_msgs/msg/vector3.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 
 using namespace std::chrono_literals;
-using namespace std::placeholders;
+using geometry_msgs::msg::Twist;
+using nav_msgs::msg::Odometry;
+using sensor_msgs::msg::LaserScan;
 
-using namespace sensor_msgs::msg;
-using namespace geometry_msgs::msg;
-using namespace nav_msgs::msg;
+namespace {
+constexpr double pi = 3.14159265358979323846;
+constexpr double rad(double degrees) { return degrees * pi / 180.0; }
+constexpr double padded_radius = 0.18 + 0.10;
+constexpr double waypoint_step = 0.75;
+constexpr double waypoint_tolerance = 0.08;
+constexpr double release_distance = 0.75;
+constexpr double stop_distance = 0.25;
+constexpr double max_turn = rad(65);
+constexpr double planning_margin = 0.04;
+constexpr double infinity = std::numeric_limits<double>::infinity();
 
-class Lab3Node : public rclcpp::Node {
+double wrap(double angle) { return std::atan2(std::sin(angle), std::cos(angle)); }
 
-private:
-  rclcpp::TimerBase::SharedPtr timer_;
+struct Point { double x, y; };
 
-  rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
-  rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
-
-  rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
-
-  Vector3 pos_;
-  Vector3 goal_;
-
-  double current_angle_ = 0.0;
-  double goal_distance_ = 1.5;
-
-  bool goal_initialized_ = false;
-  bool scan_received_ = false;
-
-  /*
-   * Filtered repulsive field in robot coordinates.
-   */
-  double repulsive_x_ = 0.0;
-  double repulsive_y_ = 0.0;
-
-  /*
-   * Obstacle clearances measured from the robot's
-   * safety boundary.
-   */
-  double closest_front_ =
-      std::numeric_limits<double>::infinity();
-
-  double closest_center_ =
-      std::numeric_limits<double>::infinity();
-
-  /*
-   * Average free space to either side.
-   */
-  double left_space_ = 0.0;
-  double right_space_ = 0.0;
-
-  /*
-   * -1 = avoid right
-   *  0 = normal APF
-   * +1 = avoid left
-   */
-  int avoidance_side_ = 0;
-
-  /*
-   * Smoothed velocity commands.
-   */
-  double steering_command_ = 0.0;
-  double speed_command_ = 0.0;
-
-public:
-  Lab3Node()
-      : rclcpp::Node("lab3_node") {
-
-    /*
-     * Example:
-     *
-     * ros2 run lab3 lab3_node \
-     *   --ros-args -p goal_distance:=4.0
-     */
-    this->declare_parameter<double>(
-        "goal_distance",
-        1.5);
-
-    goal_distance_ =
-        this->get_parameter(
-            "goal_distance").as_double();
-
-    timer_ =
-        this->create_wall_timer(
-            100ms,
-            std::bind(
-                &Lab3Node::command_loop_function,
-                this));
-
-    sub_odometry_ =
-        this->create_subscription<Odometry>(
-            "/TTB06/odom",
-            rclcpp::QoS(
-                rclcpp::QoSInitialization::from_rmw(
-                    rmw_qos_profile_sensor_data),
-                rmw_qos_profile_sensor_data),
-            std::bind(
-                &Lab3Node::odometry_callback,
-                this,
-                _1));
-
-    sub_laser_scan_ =
-        this->create_subscription<LaserScan>(
-            "/TTB06/scan",
-            rclcpp::QoS(
-                rclcpp::QoSInitialization::from_rmw(
-                    rmw_qos_profile_sensor_data),
-                rmw_qos_profile_sensor_data),
-            std::bind(
-                &Lab3Node::laser_scan_callback,
-                this,
-                _1));
-
-    pub_twist_ =
-        this->create_publisher<Twist>(
-            "/TTB06/cmd_vel",
-            10);
+// Distance the center can travel before its padded disk touches a scan point.
+// A positive curvature turns left. Distances are measured along the path.
+double contact_distance(Point p, double curvature) {
+  const double range_sq = p.x * p.x + p.y * p.y;
+  if (range_sq <= padded_radius * padded_radius) return 0.0;
+  if (std::abs(curvature) < 1e-6) {
+    if (p.x <= 0.0 || std::abs(p.y) > padded_radius) return infinity;
+    return p.x - std::sqrt(padded_radius * padded_radius - p.y * p.y);
   }
 
-  void command_loop_function() {
-
-    if (!goal_initialized_ ||
-        !scan_received_) {
-      return;
-    }
-
-    Twist cmd;
-
-    /*
-     * --------------------------------------------------
-     * Goal relative to robot
-     * --------------------------------------------------
-     */
-
-    double goal_dx =
-        goal_.x - pos_.x;
-
-    double goal_dy =
-        goal_.y - pos_.y;
-
-    double distance =
-        std::hypot(
-            goal_dx,
-            goal_dy);
-
-    /*
-     * Stop at goal.
-     */
-    if (distance < 0.05) {
-
-      speed_command_ = 0.0;
-      steering_command_ = 0.0;
-
-      cmd.linear.x = 0.0;
-      cmd.angular.z = 0.0;
-
-      pub_twist_->publish(cmd);
-
-      return;
-    }
-
-    double goal_angle =
-        std::atan2(
-            goal_dy,
-            goal_dx);
-
-    double relative_goal_angle =
-        normalize_angle(
-            goal_angle -
-            current_angle_);
-
-    /*
-     * --------------------------------------------------
-     * Attractive field
-     * --------------------------------------------------
-     */
-
-    const double attractive_gain = 1.0;
-
-    double attractive_magnitude =
-        attractive_gain *
-        std::min(
-            distance,
-            1.0);
-
-    double attractive_x =
-        attractive_magnitude *
-        std::cos(
-            relative_goal_angle);
-
-    double attractive_y =
-        attractive_magnitude *
-        std::sin(
-            relative_goal_angle);
-
-    /*
-     * --------------------------------------------------
-     * Blocked-path detection
-     * --------------------------------------------------
-     *
-     * Use both the center sector and wider forward
-     * sector. This prevents an angled wall from being
-     * ignored because it lies just outside the center.
-     */
-
-    const double center_block_distance = 0.55;
-    const double front_block_distance = 0.40;
-    const double release_distance = 0.75;
-
-    bool path_blocked =
-        closest_center_ <
-            center_block_distance ||
-        closest_front_ <
-            front_block_distance;
-
-    /*
-     * Choose an avoidance side once.
-     */
-    if (avoidance_side_ == 0 &&
-        path_blocked) {
-
-      if (left_space_ >
-          right_space_ + 0.05) {
-
-        avoidance_side_ = 1;
-
-      } else if (
-          right_space_ >
-          left_space_ + 0.05) {
-
-        avoidance_side_ = -1;
-
-      } else {
-
-        /*
-         * If both sides are about equally open,
-         * use the repulsive field to break the tie.
-         */
-        if (repulsive_y_ >= 0.0) {
-          avoidance_side_ = 1;
-        } else {
-          avoidance_side_ = -1;
-        }
-      }
-    }
-
-    /*
-     * Keep the chosen side until both the center and
-     * wider forward area are clearly open.
-     */
-    if (avoidance_side_ != 0 &&
-        closest_center_ >
-            release_distance &&
-        closest_front_ >
-            release_distance) {
-
-      avoidance_side_ = 0;
-    }
-
-    bool avoiding =
-        avoidance_side_ != 0;
-
-    /*
-     * --------------------------------------------------
-     * Select desired heading
-     * --------------------------------------------------
-     */
-
-    double desired_heading = 0.0;
-
-    bool goal_behind =
-        std::abs(
-            relative_goal_angle) >
-        85.0 *
-        M_PI /
-        180.0;
-
-    if (avoiding) {
-
-      /*
-       * A blocked path gets an explicit strong turn.
-       *
-       * This avoids the local minimum where a centered
-       * obstacle produces almost no lateral APF force.
-       */
-      const double avoid_angle =
-          65.0 *
-          M_PI /
-          180.0;
-
-      desired_heading =
-          avoidance_side_ *
-          avoid_angle;
-
-    } else if (goal_behind) {
-
-      /*
-       * If the robot has rotated too far, point back
-       * toward the goal before translating.
-       */
-      const double recovery_angle =
-          60.0 *
-          M_PI /
-          180.0;
-
-      desired_heading =
-          std::clamp(
-              relative_goal_angle,
-              -recovery_angle,
-              recovery_angle);
-
-    } else {
-
-      /*
-       * Normal artificial potential field.
-       */
-      double field_x =
-          attractive_x +
-          repulsive_x_;
-
-      double field_y =
-          attractive_y +
-          repulsive_y_;
-
-      desired_heading =
-          std::atan2(
-              field_y,
-              field_x);
-
-      /*
-       * Normal APF should not command a complete
-       * reversal.
-       */
-      const double max_heading =
-          60.0 *
-          M_PI /
-          180.0;
-
-      desired_heading =
-          std::clamp(
-              desired_heading,
-              -max_heading,
-              max_heading);
-    }
-
-    /*
-     * --------------------------------------------------
-     * Angular velocity
-     * --------------------------------------------------
-     */
-
-    const double turn_gain = 1.5;
-
-    double steering_target =
-        turn_gain *
-        desired_heading;
-
-    steering_target =
-        std::clamp(
-            steering_target,
-            -0.9,
-            0.9);
-
-    /*
-     * Smooth scan-to-scan steering changes.
-     */
-    const double steering_alpha = 0.45;
-
-    steering_command_ =
-        steering_alpha *
-            steering_target +
-        (1.0 -
-         steering_alpha) *
-            steering_command_;
-
-    if (std::abs(
-            steering_command_) <
-        0.015) {
-
-      steering_command_ = 0.0;
-    }
-
-    /*
-     * --------------------------------------------------
-     * Linear velocity
-     * --------------------------------------------------
-     */
-
-    const double max_speed = 0.15;
-
-    const double emergency_stop_distance = 0.25;
-    const double slow_distance = 0.75;
-
-    double speed_target =
-        max_speed;
-
-    /*
-     * Goal behind:
-     * rotate back toward it before moving.
-     */
-    if (goal_behind &&
-        !avoiding) {
-
-      speed_target = 0.0;
-
-    /*
-     * Explicit obstacle avoidance.
-     */
-    } else if (avoiding) {
-
-      /*
-       * Very close obstacle:
-       * turn in place.
-       */
-      if (closest_front_ <
-          emergency_stop_distance) {
-
-        speed_target = 0.0;
-
-      } else {
-
-        /*
-         * Otherwise creep forward while turning.
-         * Translation helps change the geometry and
-         * prevents getting stuck rotating forever.
-         */
-        speed_target = 0.025;
-      }
-
-    } else {
-
-      /*
-       * Normal speed reduction from forward clearance.
-       */
-      if (closest_front_ <
-          emergency_stop_distance) {
-
-        speed_target = 0.0;
-
-      } else if (
-          closest_front_ <
-          slow_distance) {
-
-        double scale =
-            (closest_front_ -
-             emergency_stop_distance) /
-            (slow_distance -
-             emergency_stop_distance);
-
-        scale =
-            std::clamp(
-                scale,
-                0.0,
-                1.0);
-
-        speed_target =
-            0.04 +
-            scale *
-                (max_speed -
-                 0.04);
-      }
-
-      /*
-       * Slow down during substantial APF turns.
-       */
-      double abs_heading =
-          std::abs(
-              desired_heading);
-
-      if (abs_heading >
-          45.0 *
-          M_PI /
-          180.0) {
-
-        speed_target =
-            std::min(
-                speed_target,
-                0.035);
-
-      } else if (
-          abs_heading >
-          25.0 *
-          M_PI /
-          180.0) {
-
-        speed_target =
-            std::min(
-                speed_target,
-                0.08);
-      }
-    }
-
-    /*
-     * Smooth normal acceleration and deceleration.
-     */
-    const double speed_alpha = 0.40;
-
-    speed_command_ =
-        speed_alpha *
-            speed_target +
-        (1.0 -
-         speed_alpha) *
-            speed_command_;
-
-    /*
-     * Safety stop is immediate, not filtered.
-     */
-    if (closest_front_ <
-        emergency_stop_distance) {
-
-      speed_command_ = 0.0;
-    }
-
-    cmd.linear.x =
-        speed_command_;
-
-    cmd.angular.z =
-        steering_command_;
-
-    pub_twist_->publish(cmd);
-
-    /*
-     * --------------------------------------------------
-     * Debug output
-     * --------------------------------------------------
-     */
-
-    RCLCPP_INFO_THROTTLE(
-        this->get_logger(),
-        *this->get_clock(),
-        500,
-        "dist=%.2f "
-        "goalAng=%.2f "
-        "rep=(%.2f %.2f) "
-        "front=%.2f "
-        "center=%.2f "
-        "left=%.2f "
-        "right=%.2f "
-        "blocked=%d "
-        "side=%d "
-        "heading=%.2f "
-        "v=%.2f "
-        "w=%.2f",
-        distance,
-        relative_goal_angle,
-        repulsive_x_,
-        repulsive_y_,
-        closest_front_,
-        closest_center_,
-        left_space_,
-        right_space_,
-        path_blocked,
-        avoidance_side_,
-        desired_heading,
-        cmd.linear.x,
-        cmd.angular.z);
-  }
-
-  void odometry_callback(
-      const Odometry &msg) {
-
-    pos_.x =
-        msg.pose.pose.position.x;
-
-    pos_.y =
-        msg.pose.pose.position.y;
-
-    double qx =
-        msg.pose.pose.orientation.x;
-
-    double qy =
-        msg.pose.pose.orientation.y;
-
-    double qz =
-        msg.pose.pose.orientation.z;
-
-    double qw =
-        msg.pose.pose.orientation.w;
-
-    /*
-     * Quaternion to yaw.
-     */
-    current_angle_ =
-        std::atan2(
-            2.0 *
-                (qw * qz +
-                 qx * qy),
-            1.0 -
-                2.0 *
-                (qy * qy +
-                 qz * qz));
-
-    /*
-     * Goal is placed goal_distance_ meters directly
-     * ahead of the initial odometry pose.
-     */
-    if (!goal_initialized_) {
-
-      goal_.x =
-          pos_.x +
-          goal_distance_ *
-              std::cos(
-                  current_angle_);
-
-      goal_.y =
-          pos_.y +
-          goal_distance_ *
-              std::sin(
-                  current_angle_);
-
-      goal_initialized_ =
-          true;
-
-      RCLCPP_INFO(
-          this->get_logger(),
-          "Start=(%.2f %.2f) "
-          "heading=%.2f "
-          "goal=(%.2f %.2f) "
-          "distance=%.2f",
-          pos_.x,
-          pos_.y,
-          current_angle_,
-          goal_.x,
-          goal_.y,
-          goal_distance_);
-    }
-  }
-
-  void laser_scan_callback(
-      const LaserScan &msg) {
-
-    /*
-     * --------------------------------------------------
-     * Geometry
-     * --------------------------------------------------
-     */
-
-    const double robot_radius = 0.18;
-    const double safety_margin = 0.10;
-
-    /*
-     * Obstacle begins influencing APF when its clearance
-     * from the robot safety boundary is below 1 m.
-     */
-    const double influence_distance = 1.0;
-
-    const double minimum_clearance = 0.05;
-
-    /*
-     * Stronger than the previous version because the
-     * repulsive sector is now correctly limited to
-     * obstacles in front of the robot.
-     */
-    const double repulsive_gain = 0.10;
-
-    /*
-     * Only rays within +/-85 degrees contribute to
-     * repulsion.
-     *
-     * cos(angle) is positive throughout this range, so
-     * every obstacle produces a non-positive X
-     * repulsive component.
-     */
-    const double repulsive_half_angle =
-        85.0 *
-        M_PI /
-        180.0;
-
-    /*
-     * Wider sector used for collision/speed control.
-     */
-    const double front_half_angle =
-        75.0 *
-        M_PI /
-        180.0;
-
-    /*
-     * Center sector used for blocked-path detection.
-     */
-    const double center_half_angle =
-        40.0 *
-        M_PI /
-        180.0;
-
-    /*
-     * Side sectors used to determine the more open
-     * avoidance direction.
-     */
-    const double side_inner_angle =
-        20.0 *
-        M_PI /
-        180.0;
-
-    const double side_outer_angle =
-        90.0 *
-        M_PI /
-        180.0;
-
-    double raw_repulsive_x = 0.0;
-    double raw_repulsive_y = 0.0;
-
-    closest_front_ =
-        std::numeric_limits<double>::
-            infinity();
-
-    closest_center_ =
-        std::numeric_limits<double>::
-            infinity();
-
-    double left_sum = 0.0;
-    double right_sum = 0.0;
-
-    int left_count = 0;
-    int right_count = 0;
-
-    /*
-     * --------------------------------------------------
-     * Process lidar
-     * --------------------------------------------------
-     */
-
-    for (size_t i = 0;
-         i < msg.ranges.size();
-         ++i) {
-
-      double angle =
-          msg.angle_min +
-          msg.angle_increment *
-              static_cast<double>(i);
-
-      angle =
-          normalize_angle(
-              angle);
-
-      double range =
-          msg.ranges[i];
-
-      /*
-       * An infinite return means nothing was detected
-       * within the sensor range. For open-space scoring,
-       * treat that direction as open.
-       */
-      bool no_return =
-          std::isinf(range) &&
-          range > 0.0;
-
-      if (no_return) {
-
-        double open_space = 1.5;
-
-        if (angle >=
-                side_inner_angle &&
-            angle <=
-                side_outer_angle) {
-
-          left_sum +=
-              open_space;
-
-          ++left_count;
-        }
-
-        if (angle <=
-                -side_inner_angle &&
-            angle >=
-                -side_outer_angle) {
-
-          right_sum +=
-              open_space;
-
-          ++right_count;
-        }
-
-        continue;
-      }
-
-      if (!std::isfinite(range)) {
-        continue;
-      }
-
-      if (range < msg.range_min ||
-          range > msg.range_max) {
-        continue;
-      }
-
-      /*
-       * No lidar angle offset is used.
-       * Testing showed angle zero is robot forward.
-       */
-      double clearance =
-          range -
-          robot_radius -
-          safety_margin;
-
-      /*
-       * ------------------------------------------------
-       * Clearance sectors
-       * ------------------------------------------------
-       */
-
-      if (std::abs(angle) <
-          front_half_angle) {
-
-        closest_front_ =
-            std::min(
-                closest_front_,
-                clearance);
-      }
-
-      if (std::abs(angle) <
-          center_half_angle) {
-
-        closest_center_ =
-            std::min(
-                closest_center_,
-                clearance);
-      }
-
-      /*
-       * ------------------------------------------------
-       * Side openness
-       * ------------------------------------------------
-       */
-
-      double space =
-          std::clamp(
-              clearance,
-              0.0,
-              1.5);
-
-      if (angle >=
-              side_inner_angle &&
-          angle <=
-              side_outer_angle) {
-
-        left_sum +=
-            space;
-
-        ++left_count;
-      }
-
-      if (angle <=
-              -side_inner_angle &&
-          angle >=
-              -side_outer_angle) {
-
-        right_sum +=
-            space;
-
-        ++right_count;
-      }
-
-      /*
-       * ------------------------------------------------
-       * APF repulsion
-       * ------------------------------------------------
-       */
-
-      if (std::abs(angle) >
-          repulsive_half_angle) {
-        continue;
-      }
-
-      if (clearance >
-          influence_distance) {
-        continue;
-      }
-
-      double rho =
-          std::max(
-              clearance,
-              minimum_clearance);
-
-      /*
-       * Standard APF:
-       *
-       * eta * (1/rho - 1/rho0) / rho^2
-       */
-      double magnitude =
-          repulsive_gain *
-          ((1.0 / rho) -
-           (1.0 /
-            influence_distance)) /
-          (rho * rho);
-
-      /*
-       * Account for angular lidar resolution.
-       */
-      magnitude *=
-          std::abs(
-              msg.angle_increment);
-
-      /*
-       * Lidar ray points toward obstacle.
-       * Repulsion points away.
-       */
-      raw_repulsive_x -=
-          magnitude *
-          std::cos(
-              angle);
-
-      raw_repulsive_y -=
-          magnitude *
-          std::sin(
-              angle);
-    }
-
-    /*
-     * --------------------------------------------------
-     * Side openness averages
-     * --------------------------------------------------
-     */
-
-    if (left_count > 0) {
-
-      left_space_ =
-          left_sum /
-          static_cast<double>(
-              left_count);
-
-    } else {
-
-      left_space_ = 0.0;
-    }
-
-    if (right_count > 0) {
-
-      right_space_ =
-          right_sum /
-          static_cast<double>(
-              right_count);
-
-    } else {
-
-      right_space_ = 0.0;
-    }
-
-    /*
-     * --------------------------------------------------
-     * Limit repulsive field
-     * --------------------------------------------------
-     */
-
-    const double max_repulsive = 2.0;
-
-    double repulsive_length =
-        std::hypot(
-            raw_repulsive_x,
-            raw_repulsive_y);
-
-    if (repulsive_length >
-        max_repulsive) {
-
-      double scale =
-          max_repulsive /
-          repulsive_length;
-
-      raw_repulsive_x *=
-          scale;
-
-      raw_repulsive_y *=
-          scale;
-    }
-
-    /*
-     * Low-pass filter the resulting field.
-     */
-    const double repulsive_alpha = 0.30;
-
-    repulsive_x_ =
-        repulsive_alpha *
-            raw_repulsive_x +
-        (1.0 -
-         repulsive_alpha) *
-            repulsive_x_;
-
-    repulsive_y_ =
-        repulsive_alpha *
-            raw_repulsive_y +
-        (1.0 -
-         repulsive_alpha) *
-            repulsive_y_;
-
-    /*
-     * Remove tiny residual values.
-     */
-    if (std::hypot(
-            repulsive_x_,
-            repulsive_y_) <
-        0.005) {
-
-      repulsive_x_ = 0.0;
-      repulsive_y_ = 0.0;
-    }
-
-    scan_received_ = true;
-  }
-
-  static double normalize_angle(
-      double angle) {
-
-    return std::atan2(
-        std::sin(angle),
-        std::cos(angle));
+  // Reflect right turns into left turns. The center of rotation is at (0, r).
+  const double r = 1.0 / std::abs(curvature);
+  const double y = curvature > 0.0 ? p.y : -p.y;
+  const double d = std::hypot(p.x, y - r);
+  if (d == 0.0 || std::abs(d - r) > padded_radius) return infinity;
+  const double nearest_angle = std::atan2(p.x, r - y);
+  const double cosine = (r * r + d * d - padded_radius * padded_radius) / (2.0 * r * d);
+  double entry = nearest_angle - std::acos(std::clamp(cosine, -1.0, 1.0));
+  if (entry < 0.0) entry += 2.0 * pi;
+  return r * entry;
+}
+
+using SteadyClock = std::chrono::steady_clock;
+struct InputTime {
+  SteadyClock::time_point receipt{};
+  double stamp = 0.0;
+  bool valid = false;
+
+  bool fresh(SteadyClock::time_point tick, double ros_now, double timeout) const {
+    const double age = ros_now - stamp;
+    return valid && std::chrono::duration<double>(tick - receipt).count() <= timeout &&
+           age >= -0.05 && age <= timeout;
   }
 };
 
-int main(
-    int argc,
-    char **argv) {
+struct CoverageBin {
+  int total = 0;
+  int usable = 0;
+  bool covered() const { return usable > 0 && usable * 2 >= total; }
+};
+}  // namespace
 
-  rclcpp::init(
-      argc,
-      argv);
+class Lab3Node : public rclcpp::Node {
+public:
+  Lab3Node() : Node("lab3_node") {
+    goal_distance_ = declare_parameter<double>("goal_distance", 1.5);
+    goal_lateral_ = declare_parameter<double>("goal_lateral", 0.0);
+    kv_ = declare_parameter<double>("kv", 0.5);
+    kp_ = declare_parameter<double>("kp", 1.5);
+    if (!std::isfinite(goal_distance_) || !std::isfinite(goal_lateral_) ||
+        !std::isfinite(kv_) || kv_ <= 0.0 || !std::isfinite(kp_) || kp_ <= 0.0)
+      throw std::invalid_argument("Goal offsets must be finite and gains finite and positive");
+    scan_timeout_ = declare_parameter<double>("scan_timeout_s", 0.5);
+    odom_timeout_ = declare_parameter<double>("odom_timeout_s", 0.5);
+    if (!std::isfinite(scan_timeout_) || scan_timeout_ <= 0.0 ||
+        !std::isfinite(odom_timeout_) || odom_timeout_ <= 0.0) {
+      throw std::invalid_argument("Sensor timeouts must be finite and positive");
+    }
+    using std::placeholders::_1;
+    sub_odometry_ = create_subscription<Odometry>("/TTB06/odom", rclcpp::SensorDataQoS(),
+        std::bind(&Lab3Node::odometry_callback, this, _1));
+    sub_laser_scan_ = create_subscription<LaserScan>("/TTB06/scan", rclcpp::SensorDataQoS(),
+        std::bind(&Lab3Node::laser_scan_callback, this, _1));
+    pub_twist_ = create_publisher<Twist>("/TTB06/cmd_vel", 10);
+    timer_ = create_wall_timer(100ms, std::bind(&Lab3Node::command_loop_function, this));
+  }
 
-  auto node =
-      std::make_shared<Lab3Node>();
+private:
+  rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
+  rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
+  rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
+  Point pos_{}, goal_{}, waypoint_{};
+  double goal_distance_, goal_lateral_, kv_, kp_, scan_timeout_, odom_timeout_;
+  double current_angle_ = 0.0;
+  bool goal_initialized_ = false;
+  bool goal_reached_ = false;
+  InputTime odom_time_, scan_time_;
+  std::vector<Point> obstacles_;
+  std::array<CoverageBin, 72> coverage_{};  // 5-degree sectors from -180 to +180
+  bool too_close_ = false;
+  double sensor_horizon_ = 0.0;
+  double speed_command_ = 0.0, steering_command_ = 0.0;
+  int avoidance_side_ = 0;  // A committed side relative to the direction to the final goal.
+  bool following_waypoint_ = false;
+  int clear_scans_ = 0;
+  double last_checked_stamp_ = -infinity;
 
-  rclcpp::executors::
-      SingleThreadedExecutor executor;
+  void stop() {
+    speed_command_ = 0.0;
+    steering_command_ = 0.0;
+    pub_twist_->publish(Twist{});
+  }
 
-  executor.add_node(
-      node);
+  double path_clearance(double curvature) const {
+    double clearance = infinity;
+    for (Point p : obstacles_) {
+      clearance = std::min(clearance, contact_distance(p, curvature));
+    }
+    return clearance;
+  }
 
+  // Cover the forward half of the footprint and the directions it sweeps
+  // through during the requested arc. Only the leading half gains new area.
+  bool path_covered(double curvature, double travel, double bearing = 0.0) const {
+    const double sweep = std::clamp(curvature * travel, -2.0 * pi, 2.0 * pi);
+    const double low = bearing + std::min(0.0, sweep) - pi / 2.0;
+    const double high = bearing + std::max(0.0, sweep) + pi / 2.0;
+    const double width = 2.0 * pi / coverage_.size();
+    for (std::size_t i = 0; i < coverage_.size(); ++i) {
+      if (coverage_[i].covered()) continue;
+      const double start = -pi + i * width;
+      for (int shift = -1; shift <= 1; ++shift) {
+        const double a = start + shift * 2.0 * pi;
+        if (a < high - 1e-9 && a + width > low + 1e-9) return false;
+      }
+    }
+    return true;
+  }
+
+  void odometry_callback(const Odometry &msg) {
+    const auto &pose = msg.pose.pose;
+    const auto &q = pose.orientation;
+    const double norm_sq = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+    if (!std::isfinite(pose.position.x) || !std::isfinite(pose.position.y) ||
+        !std::isfinite(norm_sq) || norm_sq < 1e-12) {
+      odom_time_.valid = false;
+      return;
+    }
+    const double yaw = std::atan2(2.0 * (q.w*q.z + q.x*q.y),
+                                  norm_sq - 2.0 * (q.y*q.y + q.z*q.z));
+    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
+    const auto receipt = SteadyClock::now();
+    InputTime sample{receipt, stamp, true};
+    if (!sample.fresh(receipt, now().seconds(), odom_timeout_) ||
+        (odom_time_.valid && stamp < odom_time_.stamp)) return;
+    pos_.x = pose.position.x;
+    pos_.y = pose.position.y;
+    current_angle_ = yaw;
+    odom_time_ = sample;
+    if (!goal_initialized_) {
+      goal_.x = pos_.x + goal_distance_ * std::cos(yaw) - goal_lateral_ * std::sin(yaw);
+      goal_.y = pos_.y + goal_distance_ * std::sin(yaw) + goal_lateral_ * std::cos(yaw);
+      goal_initialized_ = true;
+      RCLCPP_INFO(get_logger(), "Start=(%.2f %.2f) goal=(%.2f %.2f)",
+                  pos_.x, pos_.y, goal_.x, goal_.y);
+    }
+    if (std::hypot(goal_.x - pos_.x, goal_.y - pos_.y) < 0.05) goal_reached_ = true;
+  }
+
+  void laser_scan_callback(const LaserScan &msg) {
+    const auto receipt = SteadyClock::now();
+    InputTime sample{receipt, rclcpp::Time(msg.header.stamp).seconds(), true};
+    if (!sample.fresh(receipt, now().seconds(), scan_timeout_) ||
+        (scan_time_.valid && sample.stamp < scan_time_.stamp)) return;
+    scan_time_ = sample;
+    obstacles_.clear();
+    coverage_.fill({});
+    too_close_ = false;
+    // +Inf only certifies open space as far as the sensor can measure.
+    if (msg.ranges.empty() || !std::isfinite(msg.angle_min) ||
+        !std::isfinite(msg.angle_increment) || msg.angle_increment == 0.0f ||
+        !std::isfinite(msg.range_min) || msg.range_min < 0.0f ||
+        !std::isfinite(msg.range_max) || msg.range_max <= msg.range_min ||
+        msg.range_max < padded_radius + release_distance) {
+      scan_time_.valid = false;
+      return;
+    }
+
+    sensor_horizon_ = msg.range_max - padded_radius - planning_margin;
+    for (std::size_t i = 0; i < msg.ranges.size(); ++i) {
+      // As in the original node, the scanner is treated as centered and forward-aligned.
+      const double angle = wrap(msg.angle_min + static_cast<double>(i) * msg.angle_increment);
+      const double range = msg.ranges[i];
+      const int index = std::clamp(static_cast<int>((angle + pi) / rad(5)), 0, 71);
+      auto &bin = coverage_[index];
+      ++bin.total;
+      if (range == -infinity) {
+        too_close_ = true;
+        continue;
+      }
+      const bool open = range == infinity;
+      if (!open && (!std::isfinite(range) || range < msg.range_min || range > msg.range_max))
+        continue;
+      ++bin.usable;
+      if (!open) obstacles_.push_back({range * std::cos(angle), range * std::sin(angle)});
+    }
+  }
+
+  double distance_to(Point target) const {
+    return std::hypot(target.x - pos_.x, target.y - pos_.y);
+  }
+
+  double bearing_to(Point target) const {
+    return wrap(std::atan2(target.y - pos_.y, target.x - pos_.x) - current_angle_);
+  }
+
+  // Minimum distance between a scan point and the finite robot-center segment.
+  // The endpoint matters: an obstacle well beyond the target cannot block it.
+  double segment_gap(double bearing, double length) const {
+    const double c = std::cos(bearing), s = std::sin(bearing);
+    double best_sq = infinity;
+    for (Point p : obstacles_) {
+      const double along = std::clamp(p.x*c + p.y*s, 0.0, length);
+      const double dx = p.x - along*c, dy = p.y - along*s;
+      best_sq = std::min(best_sq, dx*dx + dy*dy);
+    }
+    return std::sqrt(best_sq) - padded_radius;
+  }
+
+  bool select_waypoint(double goal_bearing, double goal_range) {
+    // Search for an observed detour on the committed side. Prefer the smallest
+    // departure from the goal direction; for equal progress prefer more clearance.
+    const double step = std::min({waypoint_step, sensor_horizon_, goal_range});
+    for (int degrees = 10; degrees <= 90; degrees += 5) {
+      int best_side = 0;
+      double best_bearing = 0.0, best_gap = planning_margin;
+      for (int side : {1, -1}) {
+        if (avoidance_side_ != 0 && side != avoidance_side_) continue;
+        const double bearing = wrap(goal_bearing + side * rad(degrees));
+        if (std::abs(bearing) > max_turn || !path_covered(0.0, step, bearing)) continue;
+        const double gap = segment_gap(bearing, step);
+        if (gap > best_gap) {
+          best_gap = gap;
+          best_side = side;
+          best_bearing = bearing;
+        }
+      }
+      if (best_side != 0) {
+        const double heading = current_angle_ + best_bearing;
+        waypoint_ = {pos_.x + step * std::cos(heading), pos_.y + step * std::sin(heading)};
+        avoidance_side_ = best_side;
+        following_waypoint_ = true;
+        RCLCPP_INFO(get_logger(), "Detour side=%d waypoint=(%.2f %.2f)",
+                    best_side, waypoint_.x, waypoint_.y);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // One iteration of TTBLab2Node::execute_go_to_goal, using its pid=false
+  // distance branch. Lab 3 applies motion limits and publishes the result.
+  Twist go_to_goal(Point target) const {
+    Twist cmd;
+    cmd.linear.x = kv_ * distance_to(target);
+    cmd.angular.z = kp_ * bearing_to(target);
+    return cmd;
+  }
+
+  void command_loop_function() {
+    const auto tick = SteadyClock::now();
+    const double ros_now = now().seconds();
+    if (goal_reached_ || !goal_initialized_ ||
+        !odom_time_.fresh(tick, ros_now, odom_timeout_) ||
+        !scan_time_.fresh(tick, ros_now, scan_timeout_) ||
+        too_close_ || !path_covered(0.0, release_distance)) {
+      clear_scans_ = 0;
+      stop();
+      return;
+    }
+    const double goal_range = distance_to(goal_);
+    const double goal_bearing = bearing_to(goal_);
+    const double lookahead = std::min(goal_range, sensor_horizon_);
+    const bool direct_observed = path_covered(0.0, lookahead, goal_bearing);
+    const double direct_gap = segment_gap(goal_bearing, lookahead);
+    const bool direct_clear = direct_observed && direct_gap > 0.0;
+
+    // Count distinct scans, not timer ticks. Recheck the direction to the
+    // final goal even while the robot is pointing at the bypass waypoint.
+    if (scan_time_.stamp != last_checked_stamp_) {
+      last_checked_stamp_ = scan_time_.stamp;
+      if (avoidance_side_ != 0 && direct_clear)
+        clear_scans_ = std::min(clear_scans_ + 1, 3);
+      else
+        clear_scans_ = 0;
+    }
+    if (clear_scans_ == 3) {
+      following_waypoint_ = false;
+      avoidance_side_ = 0;
+      clear_scans_ = 0;
+    }
+
+    if (following_waypoint_) {
+      const double remaining = distance_to(waypoint_);
+      const double bearing = bearing_to(waypoint_);
+      if (remaining <= waypoint_tolerance || !path_covered(0.0, remaining, bearing) ||
+          segment_gap(bearing, remaining) <= 0.0)
+        following_waypoint_ = false;
+    }
+    if (!following_waypoint_ && (avoidance_side_ != 0 || !direct_clear)) {
+      // Wait for confirmation if the route has just reopened. A scan with
+      // insufficient coverage alone is never evidence of an obstacle.
+      if (!direct_observed || direct_clear || !select_waypoint(goal_bearing, goal_range)) {
+        stop();
+        return;
+      }
+    }
+
+    const Point target = following_waypoint_ ? waypoint_ : goal_;
+    const Twist desired = go_to_goal(target);
+    const double heading_error = bearing_to(target);
+    const double target_w = std::clamp(desired.angular.z, -0.9, 0.9);
+    steering_command_ = 0.45 * target_w + 0.55 * steering_command_;
+
+    // Pivot toward a new waypoint before translating to avoid cutting a corner.
+    const double remaining = distance_to(target);
+    const double travel = std::min(stop_distance, remaining);
+    if (std::abs(heading_error) > rad(15) || path_clearance(0.0) <= travel) {
+      speed_command_ = 0.0;
+    } else {
+      const double target_v = std::min({desired.linear.x, 0.15, 0.5 * goal_range});
+      speed_command_ = std::min(0.40 * target_v + 0.60 * speed_command_, target_v);
+      if (speed_command_ > 0.0) {
+        const double curvature = steering_command_ / speed_command_;
+        if (!path_covered(curvature, travel)) {
+          stop();
+          return;
+        }
+        if (path_clearance(curvature) <= travel) speed_command_ = 0.0;
+      }
+    }
+
+    Twist cmd;
+    cmd.linear.x = speed_command_;
+    cmd.angular.z = steering_command_;
+    pub_twist_->publish(cmd);
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+        "target=%s dist=%.2f goal_gap=%.2f side=%d v=%.2f w=%.2f",
+        following_waypoint_ ? "waypoint" : "goal", goal_range, direct_gap, avoidance_side_,
+        cmd.linear.x, cmd.angular.z);
+  }
+};
+
+int main(int argc, char **argv) {
+  rclcpp::init(argc, argv);
+  auto node = std::make_shared<Lab3Node>();
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
   executor.spin();
-
   rclcpp::shutdown();
-
   return 0;
 }
+
