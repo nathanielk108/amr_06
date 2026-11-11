@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <functional>
@@ -14,7 +13,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 
-using namespace std::chrono_literals;
 using geometry_msgs::msg::Twist;
 using nav_msgs::msg::Odometry;
 using sensor_msgs::msg::LaserScan;
@@ -57,18 +55,6 @@ double contact_distance(Point p, double curvature) {
   return r * entry;
 }
 
-using SteadyClock = std::chrono::steady_clock;
-struct InputTime {
-  SteadyClock::time_point receipt{};
-  double stamp = 0.0;
-  bool valid = false;
-
-  bool fresh(SteadyClock::time_point tick, double ros_now, double timeout) const {
-    const double age = ros_now - stamp;
-    return valid && std::chrono::duration<double>(tick - receipt).count() <= timeout &&
-           age >= -0.05 && age <= timeout;
-  }
-};
 
 struct CoverageBin {
   int total = 0;
@@ -87,32 +73,25 @@ public:
     if (!std::isfinite(goal_distance_) || !std::isfinite(goal_lateral_) ||
         !std::isfinite(kv_) || kv_ <= 0.0 || !std::isfinite(kp_) || kp_ <= 0.0)
       throw std::invalid_argument("Goal offsets must be finite and gains finite and positive");
-    scan_timeout_ = declare_parameter<double>("scan_timeout_s", 0.5);
-    odom_timeout_ = declare_parameter<double>("odom_timeout_s", 0.5);
-    if (!std::isfinite(scan_timeout_) || scan_timeout_ <= 0.0 ||
-        !std::isfinite(odom_timeout_) || odom_timeout_ <= 0.0) {
-      throw std::invalid_argument("Sensor timeouts must be finite and positive");
-    }
     using std::placeholders::_1;
     sub_odometry_ = create_subscription<Odometry>("/TTB06/odom", rclcpp::SensorDataQoS(),
         std::bind(&Lab3Node::odometry_callback, this, _1));
     sub_laser_scan_ = create_subscription<LaserScan>("/TTB06/scan", rclcpp::SensorDataQoS(),
         std::bind(&Lab3Node::laser_scan_callback, this, _1));
-    pub_twist_ = create_publisher<Twist>("/TTB06/cmd_vel", 10);
-    timer_ = create_wall_timer(100ms, std::bind(&Lab3Node::command_loop_function, this));
+    pub_twist_ = create_publisher<Twist>("/TTB06/cmd_vel_unstamped", 10);
   }
 
 private:
-  rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
   rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
   rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
   Point pos_{}, goal_{}, waypoint_{};
-  double goal_distance_, goal_lateral_, kv_, kp_, scan_timeout_, odom_timeout_;
+  double goal_distance_, goal_lateral_, kv_, kp_;
   double current_angle_ = 0.0;
   bool goal_initialized_ = false;
   bool goal_reached_ = false;
-  InputTime odom_time_, scan_time_;
+  bool odom_received_ = false;
+  bool scan_received_ = false;
   std::vector<Point> obstacles_;
   std::array<CoverageBin, 72> coverage_{};  // 5-degree sectors from -180 to +180
   bool too_close_ = false;
@@ -121,7 +100,6 @@ private:
   int avoidance_side_ = 0;  // A committed side relative to the direction to the final goal.
   bool following_waypoint_ = false;
   int clear_scans_ = 0;
-  double last_checked_stamp_ = -infinity;
 
   void stop() {
     speed_command_ = 0.0;
@@ -160,21 +138,13 @@ private:
     const auto &q = pose.orientation;
     const double norm_sq = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
     if (!std::isfinite(pose.position.x) || !std::isfinite(pose.position.y) ||
-        !std::isfinite(norm_sq) || norm_sq < 1e-12) {
-      odom_time_.valid = false;
-      return;
-    }
+        !std::isfinite(norm_sq) || norm_sq < 1e-12) return;
     const double yaw = std::atan2(2.0 * (q.w*q.z + q.x*q.y),
                                   norm_sq - 2.0 * (q.y*q.y + q.z*q.z));
-    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
-    const auto receipt = SteadyClock::now();
-    InputTime sample{receipt, stamp, true};
-    if (!sample.fresh(receipt, now().seconds(), odom_timeout_) ||
-        (odom_time_.valid && stamp < odom_time_.stamp)) return;
     pos_.x = pose.position.x;
     pos_.y = pose.position.y;
     current_angle_ = yaw;
-    odom_time_ = sample;
+    odom_received_ = true;
     if (!goal_initialized_) {
       goal_.x = pos_.x + goal_distance_ * std::cos(yaw) - goal_lateral_ * std::sin(yaw);
       goal_.y = pos_.y + goal_distance_ * std::sin(yaw) + goal_lateral_ * std::cos(yaw);
@@ -186,11 +156,6 @@ private:
   }
 
   void laser_scan_callback(const LaserScan &msg) {
-    const auto receipt = SteadyClock::now();
-    InputTime sample{receipt, rclcpp::Time(msg.header.stamp).seconds(), true};
-    if (!sample.fresh(receipt, now().seconds(), scan_timeout_) ||
-        (scan_time_.valid && sample.stamp < scan_time_.stamp)) return;
-    scan_time_ = sample;
     obstacles_.clear();
     coverage_.fill({});
     too_close_ = false;
@@ -200,7 +165,8 @@ private:
         !std::isfinite(msg.range_min) || msg.range_min < 0.0f ||
         !std::isfinite(msg.range_max) || msg.range_max <= msg.range_min ||
         msg.range_max < padded_radius + release_distance) {
-      scan_time_.valid = false;
+      scan_received_ = false;
+      stop();
       return;
     }
 
@@ -222,6 +188,8 @@ private:
       ++bin.usable;
       if (!open) obstacles_.push_back({range * std::cos(angle), range * std::sin(angle)});
     }
+    scan_received_ = true;
+    command_loop_function();
   }
 
   double distance_to(Point target) const {
@@ -286,11 +254,7 @@ private:
   }
 
   void command_loop_function() {
-    const auto tick = SteadyClock::now();
-    const double ros_now = now().seconds();
-    if (goal_reached_ || !goal_initialized_ ||
-        !odom_time_.fresh(tick, ros_now, odom_timeout_) ||
-        !scan_time_.fresh(tick, ros_now, scan_timeout_) ||
+    if (goal_reached_ || !goal_initialized_ || !odom_received_ || !scan_received_ ||
         too_close_ || !path_covered(0.0, release_distance)) {
       clear_scans_ = 0;
       stop();
@@ -303,15 +267,11 @@ private:
     const double direct_gap = segment_gap(goal_bearing, lookahead);
     const bool direct_clear = direct_observed && direct_gap > 0.0;
 
-    // Count distinct scans, not timer ticks. Recheck the direction to the
-    // final goal even while the robot is pointing at the bypass waypoint.
-    if (scan_time_.stamp != last_checked_stamp_) {
-      last_checked_stamp_ = scan_time_.stamp;
-      if (avoidance_side_ != 0 && direct_clear)
-        clear_scans_ = std::min(clear_scans_ + 1, 3);
-      else
-        clear_scans_ = 0;
-    }
+    // Recheck the final-goal path once per laser scan.
+    if (avoidance_side_ != 0 && direct_clear)
+      clear_scans_ = std::min(clear_scans_ + 1, 3);
+    else
+      clear_scans_ = 0;
     if (clear_scans_ == 3) {
       following_waypoint_ = false;
       avoidance_side_ = 0;
@@ -362,8 +322,7 @@ private:
     cmd.linear.x = speed_command_;
     cmd.angular.z = steering_command_;
     pub_twist_->publish(cmd);
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-        "target=%s dist=%.2f goal_gap=%.2f side=%d v=%.2f w=%.2f",
+    RCLCPP_INFO(get_logger(), "target=%s dist=%.2f goal_gap=%.2f side=%d v=%.2f w=%.2f",
         following_waypoint_ ? "waypoint" : "goal", goal_range, direct_gap, avoidance_side_,
         cmd.linear.x, cmd.angular.z);
   }
