@@ -46,12 +46,23 @@ private:
   double repulsive_y_ = 0.0;
 
   /*
-   * Closest obstacle anywhere and in front of robot.
+   * Closest obstacle anywhere.
    */
   double closest_obstacle_ =
       std::numeric_limits<double>::infinity();
 
+  /*
+   * Closest obstacle in the wider forward sector.
+   * Used mainly for speed control.
+   */
   double closest_front_obstacle_ =
+      std::numeric_limits<double>::infinity();
+
+  /*
+   * Closest obstacle directly in front of the robot.
+   * Used to determine whether the path is actually blocked.
+   */
+  double closest_center_obstacle_ =
       std::numeric_limits<double>::infinity();
 
   bool obstacle_present_ = false;
@@ -59,9 +70,9 @@ private:
   /*
    * Persistent avoidance direction.
    *
-   * -1 = pass obstacle on right
-   *  0 = no preference
-   * +1 = pass obstacle on left
+   * -1 = right
+   *  0 = none
+   * +1 = left
    */
   int avoidance_side_ = 0;
 
@@ -71,22 +82,29 @@ private:
   double steering_command_ = 0.0;
 
 public:
-  explicit Lab3Node() : rclcpp::Node("lab3_node") {
+  explicit Lab3Node()
+      : rclcpp::Node("lab3_node") {
 
     /*
-     * Goal distance can be set from command line:
+     * Example:
      *
-     * --ros-args -p goal_distance:=2.0
+     * ros2 run <package> <executable> \
+     *   --ros-args -p goal_distance:=2.0
      */
-    this->declare_parameter<double>("goal_distance", 1.5);
-    goal_distance_ =
-        this->get_parameter("goal_distance").as_double();
+    this->declare_parameter<double>(
+        "goal_distance",
+        1.5);
 
-    timer_ = this->create_wall_timer(
-        100ms,
-        std::bind(
-            &Lab3Node::command_loop_function,
-            this));
+    goal_distance_ =
+        this->get_parameter(
+            "goal_distance").as_double();
+
+    timer_ =
+        this->create_wall_timer(
+            100ms,
+            std::bind(
+                &Lab3Node::command_loop_function,
+                this));
 
     sub_odometry_ =
         this->create_subscription<Odometry>(
@@ -126,7 +144,8 @@ public:
 
   void command_loop_function() {
 
-    if (!goal_initialized_ || !scan_received_) {
+    if (!goal_initialized_ ||
+        !scan_received_) {
       return;
     }
 
@@ -137,12 +156,14 @@ public:
         goal_.y - pos_.y;
 
     double distance =
-        std::hypot(goal_dx, goal_dy);
+        std::hypot(
+            goal_dx,
+            goal_dy);
 
     Twist cmd;
 
     /*
-     * Stop at goal.
+     * Goal reached.
      */
     if (distance < 0.05) {
 
@@ -152,18 +173,21 @@ public:
       cmd.angular.z = 0.0;
 
       pub_twist_->publish(cmd);
+
       return;
     }
 
     /*
-     * Attractive field.
-     *
-     * First find the goal direction in the global frame,
-     * then express it relative to the robot heading.
+     * Direction to goal in global frame.
      */
     double goal_angle =
-        std::atan2(goal_dy, goal_dx);
+        std::atan2(
+            goal_dy,
+            goal_dx);
 
+    /*
+     * Goal direction relative to robot.
+     */
     double relative_goal_angle =
         std::atan2(
             std::sin(
@@ -173,22 +197,29 @@ public:
                 goal_angle -
                 current_angle_));
 
+    /*
+     * Attractive potential field.
+     */
     double attractive_gain = 1.0;
 
     double attractive_magnitude =
         attractive_gain *
-        std::min(distance, 1.0);
+        std::min(
+            distance,
+            1.0);
 
     double attractive_x =
         attractive_magnitude *
-        std::cos(relative_goal_angle);
+        std::cos(
+            relative_goal_angle);
 
     double attractive_y =
         attractive_magnitude *
-        std::sin(relative_goal_angle);
+        std::sin(
+            relative_goal_angle);
 
     /*
-     * Total artificial potential field.
+     * Combine attractive and repulsive fields.
      */
     double field_x =
         attractive_x +
@@ -199,91 +230,88 @@ public:
         repulsive_y_;
 
     /*
-     * Avoidance hysteresis.
+     * Use a relatively narrow central sector to determine
+     * whether an obstacle is actually blocking the path.
      *
-     * Once the robot chooses a side around an obstacle,
-     * keep that side until the obstacle is actually clear.
+     * Corridor walls should not cause the avoidance state
+     * to remain latched indefinitely.
      */
-    double avoidance_start_distance = 0.75;
-    double avoidance_release_distance = 0.90;
+    double avoidance_start_distance = 0.55;
+    double avoidance_release_distance = 0.70;
 
+    /*
+     * Select an avoidance side only when something is
+     * directly blocking the robot.
+     */
     if (avoidance_side_ == 0 &&
-        closest_front_obstacle_ <
+        closest_center_obstacle_ <
             avoidance_start_distance) {
 
-      /*
-       * Positive robot-frame Y means turn left.
-       * Negative means turn right.
-       */
       if (repulsive_y_ > 0.03) {
 
         avoidance_side_ = 1;
 
-      } else if (repulsive_y_ < -0.03) {
+      } else if (
+          repulsive_y_ < -0.03) {
 
         avoidance_side_ = -1;
 
       } else {
 
         /*
-         * Nearly centered obstacle.
-         * Pick one side to break symmetry.
+         * Symmetric obstacle directly ahead.
+         * Pick left to break the tie.
          */
         avoidance_side_ = 1;
       }
     }
 
-    if (avoidance_side_ != 0) {
+    /*
+     * Release the persistent side as soon as the central
+     * path is sufficiently clear.
+     *
+     * Do not wait for the entire repulsive field to vanish,
+     * because corridor walls may always create some
+     * repulsive force.
+     */
+    if (avoidance_side_ != 0 &&
+        closest_center_obstacle_ >
+            avoidance_release_distance) {
 
-      double repulsive_length =
-          std::hypot(
-              repulsive_x_,
-              repulsive_y_);
-
-      /*
-       * Do not release avoidance just because the
-       * obstacle moves outside the front sector.
-       */
-      if (closest_front_obstacle_ >
-              avoidance_release_distance &&
-          repulsive_length < 0.15) {
-
-        avoidance_side_ = 0;
-
-      } else {
-
-        /*
-         * Increase lateral avoidance as the obstacle
-         * gets closer.
-         */
-        double proximity =
-            1.0 -
-            std::clamp(
-                closest_front_obstacle_ /
-                    avoidance_start_distance,
-                0.0,
-                1.0);
-
-        double avoidance_bias =
-            0.20 +
-            0.50 * proximity;
-
-        field_y +=
-            avoidance_bias *
-            avoidance_side_;
-      }
+      avoidance_side_ = 0;
     }
 
     /*
-     * While avoiding an obstacle, do not allow the
-     * potential field to point behind the robot.
-     *
-     * Forward safety is handled independently by
-     * the speed controller.
+     * Apply a lateral avoidance bias while an obstacle is
+     * genuinely blocking the center of the path.
      */
     if (avoidance_side_ != 0) {
 
-      double minimum_forward_field = 0.05;
+      double proximity =
+          1.0 -
+          std::clamp(
+              closest_center_obstacle_ /
+                  avoidance_start_distance,
+              0.0,
+              1.0);
+
+      /*
+       * Stronger lateral bias as obstacle gets closer.
+       */
+      double avoidance_bias =
+          0.20 +
+          0.50 * proximity;
+
+      field_y +=
+          avoidance_bias *
+          avoidance_side_;
+
+      /*
+       * Prevent obstacle repulsion from producing a field
+       * pointing directly behind the robot.
+       */
+      double minimum_forward_field =
+          0.05;
 
       field_x =
           std::max(
@@ -297,16 +325,39 @@ public:
             field_x);
 
     /*
-     * An obstacle should never cause the robot to
-     * turn completely around and leave the goal.
-     *
-     * Limit obstacle avoidance to the forward
-     * hemisphere.
+     * If the robot has rotated so far that the goal is
+     * behind it, abandon the current avoidance maneuver
+     * and deliberately recover toward the goal.
      */
-    if (obstacle_present_) {
+    bool goal_recovery =
+        std::abs(
+            relative_goal_angle) >
+        M_PI / 2.0;
 
+    if (goal_recovery) {
+
+      avoidance_side_ = 0;
+
+      double max_recovery_heading =
+          60.0 *
+          M_PI /
+          180.0;
+
+      desired_heading =
+          std::clamp(
+              relative_goal_angle,
+              -max_recovery_heading,
+              max_recovery_heading);
+
+    } else if (obstacle_present_) {
+
+      /*
+       * Normal obstacle avoidance is also restricted to
+       * +/-60 degrees so the APF cannot command a near
+       * 180-degree reversal.
+       */
       double max_avoid_heading =
-          80.0 *
+          60.0 *
           M_PI /
           180.0;
 
@@ -333,39 +384,49 @@ public:
             1.0);
 
     /*
-     * Smooth the steering command to reduce lidar
-     * scan-to-scan jitter.
+     * Smooth angular command.
      */
-    double steering_alpha = 0.40;
+    double steering_alpha =
+        0.40;
 
     steering_command_ =
         steering_alpha *
             steering_target +
-        (1.0 - steering_alpha) *
+        (1.0 -
+         steering_alpha) *
             steering_command_;
 
     /*
-     * Ignore extremely small steering commands.
+     * Remove very small angular commands.
      */
-    if (std::abs(steering_command_) < 0.02) {
+    if (std::abs(
+            steering_command_) <
+        0.02) {
+
       steering_command_ = 0.0;
     }
 
     /*
      * Forward speed controller.
-     *
-     * Only obstacles within the forward sector
-     * directly reduce forward velocity.
      */
     double max_speed = 0.15;
 
-    double minimum_avoidance_speed = 0.03;
+    double minimum_avoidance_speed =
+        0.03;
 
-    double stop_distance = 0.15;
-    double slow_distance = 0.70;
+    double stop_distance =
+        0.15;
 
-    double speed = max_speed;
+    double slow_distance =
+        0.70;
 
+    double speed =
+        max_speed;
+
+    /*
+     * Reduce speed based on obstacles in the wider
+     * forward sector.
+     */
     if (closest_front_obstacle_ <=
         stop_distance) {
 
@@ -375,10 +436,6 @@ public:
         closest_front_obstacle_ <
         slow_distance) {
 
-      /*
-       * Linearly reduce speed as obstacle
-       * clearance decreases.
-       */
       double scale =
           (closest_front_obstacle_ -
            stop_distance) /
@@ -399,33 +456,60 @@ public:
     }
 
     /*
-     * Slow down when a large steering correction
-     * is required.
+     * Do not completely stop just because a large
+     * steering correction is required.
+     *
+     * A small amount of translation helps the robot escape
+     * APF local minima at corridor bends.
      */
     double abs_heading =
         std::abs(
             desired_heading);
 
     if (abs_heading >
-        70.0 *
-        M_PI /
-        180.0) {
-
-      speed = 0.0;
-
-    } else if (
-        abs_heading >
-        45.0 *
+        50.0 *
         M_PI /
         180.0) {
 
       speed =
           std::min(
               speed,
-              0.04);
+              0.03);
+
+    } else if (
+        abs_heading >
+        35.0 *
+        M_PI /
+        180.0) {
+
+      speed =
+          std::min(
+              speed,
+              0.06);
     }
 
-    cmd.linear.x = speed;
+    /*
+     * If something is dangerously close directly ahead,
+     * still allow a full stop.
+     */
+    if (closest_center_obstacle_ <=
+        stop_distance) {
+
+      speed = 0.0;
+    }
+
+    /*
+     * During goal recovery, rotate toward the goal before
+     * translating again.
+     */
+    if (goal_recovery) {
+
+      speed = 0.0;
+    }
+
+    cmd.linear.x =
+        speed;
+
     cmd.angular.z =
         steering_command_;
 
@@ -436,14 +520,19 @@ public:
         *this->get_clock(),
         500,
         "dist=%.2f "
+        "goalAng=%.2f "
         "att=(%.2f %.2f) "
         "rep=(%.2f %.2f) "
         "field=(%.2f %.2f) "
         "front=%.2f "
+        "center=%.2f "
         "side=%d "
+        "recover=%d "
         "heading=%.2f "
-        "v=%.2f w=%.2f",
+        "v=%.2f "
+        "w=%.2f",
         distance,
+        relative_goal_angle,
         attractive_x,
         attractive_y,
         repulsive_x_,
@@ -451,7 +540,9 @@ public:
         field_x,
         field_y,
         closest_front_obstacle_,
+        closest_center_obstacle_,
         avoidance_side_,
+        goal_recovery,
         desired_heading,
         cmd.linear.x,
         cmd.angular.z);
@@ -492,8 +583,7 @@ public:
                  qz * qz));
 
     /*
-     * Place goal goal_distance_ meters directly
-     * ahead of the robot's initial pose.
+     * Place goal directly ahead of the initial pose.
      */
     if (!goal_initialized_) {
 
@@ -509,7 +599,8 @@ public:
               std::sin(
                   current_angle_);
 
-      goal_initialized_ = true;
+      goal_initialized_ =
+          true;
 
       RCLCPP_INFO(
           this->get_logger(),
@@ -530,40 +621,58 @@ public:
       const LaserScan &msg) {
 
     /*
-     * Repulsive field parameters.
+     * APF parameters.
      */
-    double robot_radius = 0.18;
-    double safety_margin = 0.10;
+    double robot_radius =
+        0.18;
 
-    double influence_distance = 0.75;
-    double repulsive_gain = 0.08;
+    double safety_margin =
+        0.10;
 
-    double minimum_clearance = 0.05;
+    double influence_distance =
+        0.75;
 
-    /*
-     * Calculate a new raw field for this scan.
-     * The stored field is filtered later.
-     */
-    double raw_repulsive_x = 0.0;
-    double raw_repulsive_y = 0.0;
+    double repulsive_gain =
+        0.08;
+
+    double minimum_clearance =
+        0.05;
+
+    double raw_repulsive_x =
+        0.0;
+
+    double raw_repulsive_y =
+        0.0;
 
     closest_obstacle_ =
-        std::numeric_limits<double>::infinity();
+        std::numeric_limits<double>::
+            infinity();
 
     closest_front_obstacle_ =
-        std::numeric_limits<double>::infinity();
+        std::numeric_limits<double>::
+            infinity();
 
-    obstacle_present_ = false;
+    closest_center_obstacle_ =
+        std::numeric_limits<double>::
+            infinity();
+
+    obstacle_present_ =
+        false;
 
     /*
-     * Obstacles within +/-80 degrees are considered
-     * forward obstacles for speed control.
-     *
-     * Obstacles outside this sector still contribute
-     * repulsive force.
+     * Wide sector used for speed reduction.
      */
     double front_half_angle =
         80.0 *
+        M_PI /
+        180.0;
+
+    /*
+     * Narrow sector used to determine whether the
+     * path itself is blocked.
+     */
+    double center_half_angle =
+        30.0 *
         M_PI /
         180.0;
 
@@ -584,8 +693,7 @@ public:
       }
 
       /*
-       * LaserScan angle 0 is treated as forward.
-       * No lidar offset is applied.
+       * LaserScan angle zero is treated as forward.
        */
       double angle =
           msg.angle_min +
@@ -598,8 +706,7 @@ public:
               std::cos(angle));
 
       /*
-       * Convert sensor range into clearance from the
-       * robot's safety boundary.
+       * Clearance from the robot safety boundary.
        */
       double clearance =
           range -
@@ -612,8 +719,7 @@ public:
               clearance);
 
       /*
-       * Track front clearance separately for
-       * forward speed control.
+       * Wider front sector for speed control.
        */
       if (std::abs(angle) <
           front_half_angle) {
@@ -625,27 +731,36 @@ public:
       }
 
       /*
-       * Obstacles outside the influence distance do
-       * not produce a repulsive field.
+       * Narrow center sector for blocked-path logic.
+       */
+      if (std::abs(angle) <
+          center_half_angle) {
+
+        closest_center_obstacle_ =
+            std::min(
+                closest_center_obstacle_,
+                clearance);
+      }
+
+      /*
+       * Outside influence range:
+       * no repulsive contribution.
        */
       if (clearance >
           influence_distance) {
         continue;
       }
 
-      obstacle_present_ = true;
+      obstacle_present_ =
+          true;
 
-      /*
-       * Prevent singularity when something is very
-       * close to the robot.
-       */
       clearance =
           std::max(
               clearance,
               minimum_clearance);
 
       /*
-       * Standard APF repulsive magnitude:
+       * Standard APF repulsive force:
        *
        * eta * (1/rho - 1/rho0) / rho^2
        */
@@ -658,17 +773,14 @@ public:
            clearance);
 
       /*
-       * Approximate integration over lidar angle so
-       * field strength does not depend strongly on
-       * lidar angular resolution.
+       * Approximate angular integration.
        */
       magnitude *=
           std::abs(
               msg.angle_increment);
 
       /*
-       * Laser ray points toward obstacle.
-       * Repulsive force points away from it.
+       * Force points opposite lidar ray.
        */
       raw_repulsive_x -=
           magnitude *
@@ -680,13 +792,10 @@ public:
     }
 
     /*
-     * Limit the magnitude of the repulsive field.
-     *
-     * This allows strong avoidance without letting
-     * a close obstacle create an arbitrarily large
-     * field.
+     * Saturate repulsive field.
      */
-    double max_repulsive = 2.0;
+    double max_repulsive =
+        2.0;
 
     double repulsive_length =
         std::hypot(
@@ -706,9 +815,10 @@ public:
     }
 
     /*
-     * Low-pass filter the complete repulsive vector.
+     * Low-pass filter repulsive vector.
      */
-    double repulsive_alpha = 0.25;
+    double repulsive_alpha =
+        0.25;
 
     repulsive_x_ =
         repulsive_alpha *
@@ -725,8 +835,7 @@ public:
             repulsive_y_;
 
     /*
-     * Remove tiny residual forces once the obstacle
-     * has disappeared.
+     * Remove small residual filtered forces.
      */
     if (!obstacle_present_ &&
         std::hypot(
@@ -738,7 +847,8 @@ public:
       repulsive_y_ = 0.0;
     }
 
-    scan_received_ = true;
+    scan_received_ =
+        true;
   }
 };
 
