@@ -32,7 +32,8 @@ using namespace nav_msgs::msg;
 
 enum class RobotState {
   NAVIGATING,
-  RECOVERY_ROTATE   // spin away from the obstacle, then go back to NAVIGATING (no blind forward drive)
+  RECOVERY_BACKUP,  // reverse straight away from the closest scan point
+  RECOVERY_ROTATE   // then spin away from the obstacle, then back to NAVIGATING (no blind forward drive)
 };
 
 // One valid lidar return, expressed in the robot body frame
@@ -93,6 +94,7 @@ private:
   double brake_margin_ = 0.10;           // Extra stopping distance in front of min_safe_distance_
   double lookahead_ = 2.0;               // Distance (m) at which a heading counts as fully open
   double min_heading_clear_ = 0.60;      // A heading needs this much free distance to be a candidate
+  double goal_distance_ = 10.0;          // Goal = this far straight ahead of the START pose/heading (m)
   double goal_tolerance_ = 0.10;         // Goal reach threshold (m)  (lab2 "margin")
   double lidar_yaw_offset_ = 0.0;        // Set if scan angle 0 is NOT the robot's front (rad)
   double scan_timeout_ = 0.5;            // Stop if scan is older than this (s)
@@ -118,8 +120,20 @@ private:
   double stuck_displacement_ = 0.10;     // < 10 cm net motion in the window => stuck
   int recovery_spin_dir_ = 1;            // +1 CCW, -1 CW
   int recovery_ticks_ = 0;
-  int recovery_rotate_timeout_ = 100;    // 10 s
-  double recovery_clear_ = 0.80;         // free distance needed (over a +/-20 deg wedge) to leave RECOVERY_ROTATE
+  int recovery_rotate_timeout_ = 70;     // 7 s (a bit more than one full revolution)
+  double recovery_clear_ = 0.70;         // free distance needed (over a +/-20 deg wedge) to leave RECOVERY_ROTATE
+
+  // Backing away from the closest scan point
+  double backup_trigger_ = 0.45;         // back up if the closest point is nearer than this (m)
+  double backup_clear_ = 0.50;           // stop backing once the closest point is this far (m)
+  double backup_max_distance_ = 0.40;    // never reverse further than this per attempt (m)
+  double backup_speed_ = 0.10;           // reverse speed (m/s)
+  double backup_min_rear_ = 0.30;        // need this much free space behind (m) to reverse
+  int backup_timeout_ = 50;              // 5 s
+  double backup_start_x_ = 0.0;
+  double backup_start_y_ = 0.0;
+  bool backed_up_ = false;               // only one backup per recovery episode (no endless loops)
+  double bump_bearing_ = 0.0;            // body-frame bearing of the bumper that fired (rad)
   double recovery_min_turn_ = 60.0 * M_PI / 180.0;  // always spin at least this far away before leaving
   double recovery_start_yaw_ = 0.0;
 
@@ -159,7 +173,7 @@ public:
     pos_.x = 0.0;
     pos_.y = 0.0;
     pos_.z = 0.0;
-    goal_.x = 1.5;   // goal relative to start pose
+    goal_.x = goal_distance_;   // goal 10 m straight ahead of the start pose (origin frame +x = start heading)
     goal_.y = 0.0;
     goal_.z = 0.0;
   }
@@ -171,13 +185,16 @@ private:
   // how far the robot can travel. This replaces the single-ray test, which let
   // the robot aim at gaps/headings that were narrower than its body.
   // ---------------------------------------------------------------------------
-  double free_distance(double heading) {
+  double free_distance(double heading, double half_width = -1.0) {
+    if (half_width < 0.0) {
+      half_width = corridor_half_width_;
+    }
     double free = lookahead_;
     for (const auto &p : world_obstacles_) {
       double rel = wrap(p.angle - heading);
       double forward = p.range * std::cos(rel);
       double lateral = std::abs(p.range * std::sin(rel));
-      if (forward > 0.0 && lateral < corridor_half_width_ && forward < free) {
+      if (forward > 0.0 && lateral < half_width && forward < free) {
         free = forward;
       }
     }
@@ -264,14 +281,59 @@ private:
     return (best_h >= 0.0) ? 1 : -1;
   }
 
-  void start_recovery(const char *reason, int forced_dir = 0) {
-    remember_obstacles(1.0);   // blacklist the box so the escape path never re-enters its inflated zone
-    recovery_spin_dir_ = (forced_dir != 0) ? forced_dir : away_spin_dir();
-    recovery_start_yaw_ = current_angle_;
+  // Closest point of the live + remembered obstacles (the thing we must back away from)
+  bool closest_point(ScanPoint &closest) {
+    if (world_obstacles_.empty()) {
+      return false;
+    }
+    closest = world_obstacles_.front();
+    for (const auto &p : world_obstacles_) {
+      if (p.range < closest.range) {
+        closest = p;
+      }
+    }
+    return true;
+  }
+
+  // Reversing is only allowed if the closest point is ahead of us (so backing increases the gap)
+  // and the space behind the robot body is free.
+  bool should_back_up() {
+    ScanPoint c;
+    if (!closest_point(c)) {
+      return false;
+    }
+    bool close_and_in_front = c.range < backup_trigger_ && std::abs(c.angle) <= 100.0 * M_PI / 180.0;
+    bool rear_free = free_distance(M_PI, robot_radius_) > backup_min_rear_;
+    return close_and_in_front && rear_free;
+  }
+
+  void begin_backup() {
+    state_ = RobotState::RECOVERY_BACKUP;
     recovery_ticks_ = 0;
+    backed_up_ = true;
+    backup_start_x_ = pos_.x;
+    backup_start_y_ = pos_.y;
+    RCLCPP_WARN(this->get_logger(), "Backing away from closest obstacle.");
+  }
+
+  void begin_rotate() {
     state_ = RobotState::RECOVERY_ROTATE;
-    RCLCPP_WARN(this->get_logger(), "%s Spinning %s away from obstacle.", reason,
-                recovery_spin_dir_ > 0 ? "CCW" : "CW");
+    recovery_ticks_ = 0;
+    recovery_start_yaw_ = current_angle_;
+    recovery_spin_dir_ = (bump_spin_dir_ != 0) ? bump_spin_dir_ : away_spin_dir();
+    bump_spin_dir_ = 0;   // one-shot: only the episode that follows a bump uses the bumper side
+    RCLCPP_WARN(this->get_logger(), "Spinning %s away from obstacle.", recovery_spin_dir_ > 0 ? "CCW" : "CW");
+  }
+
+  void start_recovery(const char *reason) {
+    RCLCPP_WARN(this->get_logger(), "%s", reason);
+    remember_obstacles(1.0);   // blacklist the box so the escape path never re-enters its inflated zone
+    backed_up_ = false;
+    if (should_back_up()) {
+      begin_backup();          // first get away from the closest scan point, THEN spin
+    } else {
+      begin_rotate();
+    }
   }
 
   // Clear enough over the whole forward wedge (+/- 20 deg), not just a single ray
@@ -309,20 +371,46 @@ private:
       return;
     }
 
-    // 1b. Bumper contact: we already hit it. Stop, remember the box, spin away.
+    // 1b. Bumper contact: we already hit it. Stop, remember the box (even if it is closer than
+    //     the lidar's range_min), then back off and spin away.
     if (bump_pending_) {
       bump_pending_ = false;
       stop_robot();
-      if (state_ == RobotState::RECOVERY_ROTATE) {
-        remember_obstacles(1.0);   // already spinning: just refresh the box in memory
-      } else {
+      // Virtual obstacle just in front of the bumper that fired
+      memory_.push_back({pos_.x + 0.22 * std::cos(current_angle_ + bump_bearing_),
+                         pos_.y + 0.22 * std::sin(current_angle_ + bump_bearing_), this->now()});
+      build_world_obstacles();
+      if (state_ == RobotState::NAVIGATING) {
         pose_history_.clear();
-        start_recovery("Bumper triggered!", bump_spin_dir_);
+        start_recovery("Bumper triggered!");
+      } else {
+        remember_obstacles(1.0);   // already recovering: just refresh the box in memory
       }
       return;
     }
 
-    // 2. Recovery: spin away from the box (no forced forward drive)
+    // 2a. Recovery: reverse straight away from the closest scan point
+    if (state_ == RobotState::RECOVERY_BACKUP) {
+      recovery_ticks_++;
+      double backed = std::hypot(pos_.x - backup_start_x_, pos_.y - backup_start_y_);
+      ScanPoint c;
+      double closest = closest_point(c) ? c.range : lookahead_;
+      bool rear_free = free_distance(M_PI, robot_radius_) > backup_min_rear_;
+
+      if (backed >= backup_max_distance_ || closest >= backup_clear_ || !rear_free ||
+          recovery_ticks_ > backup_timeout_) {
+        stop_robot();
+        begin_rotate();
+        return;
+      }
+
+      cmd.linear.x = -backup_speed_;
+      cmd.angular.z = 0.0;
+      pub_twist_->publish(cmd);
+      return;
+    }
+
+    // 2b. Recovery: spin away from the box (no forced forward drive)
     if (state_ == RobotState::RECOVERY_ROTATE) {
       recovery_ticks_++;
       double turned = std::abs(wrap(current_angle_ - recovery_start_yaw_));
@@ -340,11 +428,17 @@ private:
         return;
       }
       if (recovery_ticks_ > recovery_rotate_timeout_) {
-        state_ = RobotState::NAVIGATING;
-        pose_history_.clear();
-        prev_heading_ = 0.0;
-        RCLCPP_WARN(this->get_logger(), "Recovery rotate timed out. Resuming navigation.");
+        // Spinning did not open a path (e.g. wedged in close): reverse from the closest point
+        // once, otherwise give navigation another try instead of spinning forever.
         stop_robot();
+        if (!backed_up_ && should_back_up()) {
+          begin_backup();
+        } else {
+          state_ = RobotState::NAVIGATING;
+          pose_history_.clear();
+          prev_heading_ = 0.0;
+          RCLCPP_WARN(this->get_logger(), "Recovery rotate timed out. Resuming navigation.");
+        }
         return;
       }
 
@@ -446,6 +540,11 @@ private:
       origin_y_ = raw_y;
       origin_yaw_ = raw_yaw;
       origin_rendered_ = true;
+      // The origin frame is anchored to the robot's pose on the first odom message, with +x along
+      // its heading at that moment, so "10 m ahead of the start" is simply (goal_distance_, 0).
+      goal_.x = goal_distance_;
+      goal_.y = 0.0;
+      RCLCPP_INFO(this->get_logger(), "Start pose captured. Goal is %.1f m straight ahead.", goal_distance_);
     }
 
     // Map to relative starting origin
@@ -468,10 +567,13 @@ private:
       const std::string &f = d.header.frame_id;
       if (f.find("left") != std::string::npos) {
         bump_spin_dir_ = -1;
+        bump_bearing_ = 30.0 * M_PI / 180.0;
       } else if (f.find("right") != std::string::npos) {
         bump_spin_dir_ = 1;
+        bump_bearing_ = -30.0 * M_PI / 180.0;
       } else {
         bump_spin_dir_ = 0;   // centre bump: decide from the lidar
+        bump_bearing_ = 0.0;
       }
     }
   }
