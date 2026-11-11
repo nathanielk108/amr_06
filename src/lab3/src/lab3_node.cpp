@@ -29,16 +29,18 @@ private:
   };
 
   struct Candidate {
-    double velocity;
-    double steering;
-    double score;
-    double clearance;
-    bool safe;
+    double velocity = 0.0;
+    double steering = 0.0;
+    double score = -std::numeric_limits<double>::infinity();
+    double clearance = 0.0;
+    bool safe = false;
   };
 
   rclcpp::TimerBase::SharedPtr timer_;
+
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
   rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
+
   rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
 
   Vector3 pos_;
@@ -57,13 +59,19 @@ private:
   double steering_command_ = 0.0;
   double previous_steering_ = 0.0;
 
+  int avoidance_side_ = 0;
+  int direct_clear_scans_ = 0;
+
   bool goal_initialized_ = false;
   bool odom_received_ = false;
   bool scan_received_ = false;
+  bool new_scan_ = false;
+  bool flip_lidar_ = false;
 
 public:
   explicit Lab3Node() : rclcpp::Node("lab3_node") {
     goal_distance_ = this->declare_parameter<double>("goal_distance", 1.5);
+    flip_lidar_ = this->declare_parameter<bool>("flip_lidar", false);
 
     timer_ = this->create_wall_timer(
       50ms, std::bind(&Lab3Node::command_loop_function, this));
@@ -88,6 +96,12 @@ public:
     pos_.y = 0.0;
     goal_.x = 0.0;
     goal_.y = 0.0;
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "goal_distance=%.2f flip_lidar=%s",
+      goal_distance_,
+      flip_lidar_ ? "true" : "false");
   }
 
 private:
@@ -95,10 +109,18 @@ private:
     return std::atan2(std::sin(angle), std::cos(angle));
   }
 
+  static int steering_side(double steering) {
+    if (steering > 0.05) return 1;
+    if (steering < -0.05) return -1;
+    return 0;
+  }
+
   void stop() {
     speed_command_ = 0.0;
     steering_command_ = 0.0;
     previous_steering_ = 0.0;
+    avoidance_side_ = 0;
+    direct_clear_scans_ = 0;
     pub_twist_->publish(Twist());
   }
 
@@ -110,7 +132,7 @@ private:
     const double collision_radius = robot_radius + safety_margin;
     const double collision_radius_sq = collision_radius * collision_radius;
 
-    const double horizon = 1.2;
+    const double horizon = 3.0;
     const double dt = 0.05;
     const int steps = static_cast<int>(horizon / dt);
 
@@ -126,6 +148,7 @@ private:
 
     for (int step = 0; step < steps; step++) {
       double theta_mid = theta + 0.5 * steering * dt;
+
       x += velocity * std::cos(theta_mid) * dt;
       y += velocity * std::sin(theta_mid) * dt;
       theta = wrap_angle(theta + steering * dt);
@@ -139,8 +162,6 @@ private:
 
         if (distance_sq < collision_radius_sq) {
           candidate.safe = false;
-          candidate.score = -std::numeric_limits<double>::infinity();
-          candidate.clearance = 0.0;
           return candidate;
         }
       }
@@ -157,20 +178,59 @@ private:
     if (!std::isfinite(clearance)) clearance = 2.0;
     clearance = std::clamp(clearance, 0.0, 1.0);
 
+    double side_switch_penalty = 0.0;
+    int side = steering_side(steering);
+
+    if (avoidance_side_ != 0 && side != 0 && side != avoidance_side_)
+      side_switch_penalty = 3.0;
+
     candidate.clearance = clearance;
     candidate.score =
       8.0 * progress +
-      1.0 * clearance -
+      1.2 * clearance -
       0.6 * std::abs(final_goal_heading) -
-      0.25 * std::abs(steering - previous_steering_) +
+      0.15 * std::abs(steering) -
+      0.20 * std::abs(steering - previous_steering_) -
+      side_switch_penalty +
       0.5 * velocity;
 
     return candidate;
   }
 
-  void command_loop_function() {
-    if (!goal_initialized_ || !odom_received_ || !scan_received_) return;
+  Candidate find_best_candidate(double goal_x, double goal_y, double distance) const {
+    const std::array<double, 3> velocities = {0.07, 0.11, 0.15};
+    const std::array<double, 9> steering_rates = {
+      -0.9, -0.7, -0.5, -0.25, 0.0, 0.25, 0.5, 0.7, 0.9
+    };
 
+    Candidate best;
+
+    for (double velocity : velocities) {
+      for (double steering : steering_rates) {
+        Candidate candidate = evaluate_candidate(
+          velocity, steering, goal_x, goal_y, distance);
+
+        if (candidate.safe && candidate.score > best.score)
+          best = candidate;
+      }
+    }
+
+    const std::array<double, 2> turn_rates = {-0.8, 0.8};
+
+    for (double steering : turn_rates) {
+      Candidate candidate = evaluate_candidate(
+        0.0, steering, goal_x, goal_y, distance);
+
+      candidate.score -= 0.5;
+
+      if (candidate.safe && candidate.score > best.score)
+        best = candidate;
+    }
+
+    return best;
+  }
+
+  void plan_command() {
     double goal_dx = goal_.x - pos_.x;
     double goal_dy = goal_.y - pos_.y;
     double distance = std::hypot(goal_dx, goal_dy);
@@ -186,76 +246,101 @@ private:
     double goal_x = distance * std::cos(goal_bearing);
     double goal_y = distance * std::sin(goal_bearing);
 
-    const std::array<double, 3> velocities = {0.07, 0.11, 0.15};
-    const std::array<double, 9> steering_rates = {
-      -0.9, -0.7, -0.5, -0.25, 0.0, 0.25, 0.5, 0.7, 0.9
-    };
+    Candidate straight = evaluate_candidate(
+      0.15, 0.0, goal_x, goal_y, distance);
 
-    Candidate best;
-    best.safe = false;
-    best.score = -std::numeric_limits<double>::infinity();
+    bool direct_clear =
+      straight.safe &&
+      closest_front_ > 0.60;
 
-    for (double velocity : velocities) {
-      for (double steering : steering_rates) {
-        Candidate candidate = evaluate_candidate(
-          velocity, steering, goal_x, goal_y, distance);
+    if (avoidance_side_ != 0) {
+      if (direct_clear)
+        direct_clear_scans_++;
+      else
+        direct_clear_scans_ = 0;
 
-        if (candidate.safe && candidate.score > best.score) {
-          best = candidate;
-        }
+      if (direct_clear_scans_ >= 3) {
+        avoidance_side_ = 0;
+        direct_clear_scans_ = 0;
       }
     }
 
-    double target_velocity = 0.0;
-    double target_steering = 0.0;
+    Candidate best = find_best_candidate(goal_x, goal_y, distance);
 
-    if (best.safe) {
-      target_velocity = best.velocity;
-      target_steering = best.steering;
-    }
-    else {
-      target_velocity = 0.0;
+    if (!best.safe) {
+      speed_command_ = 0.0;
 
-      if (left_space_ > right_space_ + 0.10)
-        target_steering = 0.8;
-      else if (right_space_ > left_space_ + 0.10)
-        target_steering = -0.8;
-      else if (std::abs(previous_steering_) > 0.1)
-        target_steering = previous_steering_ > 0.0 ? 0.8 : -0.8;
-      else
-        target_steering = goal_bearing >= 0.0 ? 0.8 : -0.8;
+      if (avoidance_side_ == 0) {
+        if (left_space_ > right_space_ + 0.10)
+          avoidance_side_ = 1;
+        else if (right_space_ > left_space_ + 0.10)
+          avoidance_side_ = -1;
+        else if (std::abs(previous_steering_) > 0.10)
+          avoidance_side_ = steering_side(previous_steering_);
+        else
+          avoidance_side_ = goal_bearing >= 0.0 ? 1 : -1;
+      }
+
+      steering_command_ = 0.8 * avoidance_side_;
+      previous_steering_ = steering_command_;
+      return;
     }
+
+    int best_side = steering_side(best.steering);
+
+    if (avoidance_side_ == 0 &&
+        !direct_clear &&
+        best_side != 0) {
+      avoidance_side_ = best_side;
+      direct_clear_scans_ = 0;
+    }
+
+    double target_velocity = best.velocity;
+    double target_steering = best.steering;
 
     const double hard_stop_distance = 0.30;
 
     if (closest_front_ < hard_stop_distance)
       target_velocity = 0.0;
 
-    speed_command_ = 0.50 * target_velocity + 0.50 * speed_command_;
-    steering_command_ = 0.55 * target_steering + 0.45 * steering_command_;
+    speed_command_ =
+      0.50 * target_velocity +
+      0.50 * speed_command_;
+
+    steering_command_ =
+      0.55 * target_steering +
+      0.45 * steering_command_;
 
     if (closest_front_ < hard_stop_distance)
       speed_command_ = 0.0;
 
     previous_steering_ = target_steering;
 
+    RCLCPP_INFO(
+      this->get_logger(),
+      "dist=%.2f front=%.2f left=%.2f right=%.2f side=%d best=(%.2f %.2f) score=%.2f",
+      distance,
+      closest_front_,
+      left_space_,
+      right_space_,
+      avoidance_side_,
+      best.velocity,
+      best.steering,
+      best.score);
+  }
+
+  void command_loop_function() {
+    if (!goal_initialized_ || !odom_received_ || !scan_received_) return;
+
+    if (new_scan_) {
+      plan_command();
+      new_scan_ = false;
+    }
+
     Twist cmd;
     cmd.linear.x = speed_command_;
     cmd.angular.z = steering_command_;
     pub_twist_->publish(cmd);
-
-    RCLCPP_INFO_THROTTLE(
-      this->get_logger(),
-      *this->get_clock(),
-      500,
-      "dist=%.2f obs=%zu front=%.2f left=%.2f right=%.2f v=%.2f w=%.2f",
-      distance,
-      obstacles_.size(),
-      closest_front_,
-      left_space_,
-      right_space_,
-      cmd.linear.x,
-      cmd.angular.z);
   }
 
   void odometry_callback(const Odometry &msg) {
@@ -286,7 +371,7 @@ private:
   }
 
   void laser_scan_callback(const LaserScan &msg) {
-    const double planning_range = 2.0;
+    const double planning_range = 2.5;
     const double side_range = 2.0;
     const double front_half_angle = 60.0 * M_PI / 180.0;
     const double side_inner_angle = 20.0 * M_PI / 180.0;
@@ -304,6 +389,9 @@ private:
       double angle = wrap_angle(
         msg.angle_min + static_cast<double>(i) * msg.angle_increment);
 
+      if (flip_lidar_)
+        angle = -angle;
+
       double range = msg.ranges[i];
 
       if (std::isinf(range) && range > 0.0) {
@@ -311,10 +399,12 @@ private:
           left_sum += side_range;
           left_count++;
         }
+
         if (angle <= -side_inner_angle && angle >= -side_outer_angle) {
           right_sum += side_range;
           right_count++;
         }
+
         continue;
       }
 
@@ -348,6 +438,7 @@ private:
     right_space_ = right_count > 0 ? right_sum / right_count : 0.0;
 
     scan_received_ = true;
+    new_scan_ = true;
   }
 };
 
