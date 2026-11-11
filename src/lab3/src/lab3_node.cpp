@@ -4,6 +4,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -20,6 +21,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
+#include <irobot_create_msgs/msg/hazard_detection_vector.hpp>
 
 using namespace std::chrono_literals;
 using namespace std::placeholders;
@@ -30,8 +32,7 @@ using namespace nav_msgs::msg;
 
 enum class RobotState {
   NAVIGATING,
-  RECOVERY_ROTATE,
-  RECOVERY_FORWARD
+  RECOVERY_ROTATE   // spin away from the obstacle, then go back to NAVIGATING (no blind forward drive)
 };
 
 // One valid lidar return, expressed in the robot body frame
@@ -40,12 +41,21 @@ struct ScanPoint {
   double range;  // m
 };
 
+// An obstacle point remembered in the odom/origin frame (survives leaving the lidar view
+// or being closer than the lidar's range_min, e.g. a box we are touching)
+struct MemoryPoint {
+  double x;
+  double y;
+  rclcpp::Time stamp;
+};
+
 class Lab3Node : public rclcpp::Node {
 private:
   // ROS 2 Handles
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
   rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
+  rclcpp::Subscription<irobot_create_msgs::msg::HazardDetectionVector>::SharedPtr sub_hazard_;
   rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
 
   // Vehicle State (Origin-Transformed Frame, same convention as lab2: pos_ + current_angle_)
@@ -63,7 +73,15 @@ private:
   bool origin_rendered_ = false;
 
   // LiDAR Data (pre-processed in the callback)
-  std::vector<ScanPoint> obstacles_;   // finite returns = real obstacles
+  std::vector<ScanPoint> obstacles_;        // live finite returns = real obstacles
+  std::vector<ScanPoint> world_obstacles_;  // live + remembered obstacles (body frame), rebuilt every tick
+  std::vector<MemoryPoint> memory_;         // obstacles we hit / got stuck on
+  double memory_duration_ = 60.0;           // s a remembered obstacle stays active
+  size_t memory_max_points_ = 400;
+
+  // Bumper
+  bool bump_pending_ = false;
+  int bump_spin_dir_ = 0;                   // +1 CCW, -1 CW, 0 = decide from lidar
   size_t valid_rays_ = 0;              // finite + "inf" (no return) rays; 0 => lidar is dead
   rclcpp::Time last_scan_time_{0, 0, RCL_ROS_TIME};
 
@@ -71,7 +89,8 @@ private:
   double robot_radius_ = 0.20;           // Disk abstraction radius (m)
   double buffer_clearance_ = 0.10;       // Safety buffer beyond disk abstraction (m)
   double min_safe_distance_ = 0.30;      // Stop / reject distance straight ahead (radius + buffer)
-  double corridor_half_width_ = 0.25;    // Half-width of the swept "tube" used to test a heading
+  double corridor_half_width_ = 0.30;    // Swept tube half-width = disk radius + safety buffer (min_safe_distance_)
+  double brake_margin_ = 0.10;           // Extra stopping distance in front of min_safe_distance_
   double lookahead_ = 2.0;               // Distance (m) at which a heading counts as fully open
   double min_heading_clear_ = 0.60;      // A heading needs this much free distance to be a candidate
   double goal_tolerance_ = 0.10;         // Goal reach threshold (m)  (lab2 "margin")
@@ -83,7 +102,6 @@ private:
   double max_ang_vel_ = M_PI / 3.0;      // Angular speed cap (rad/s)
   double kv_ = 0.5;                      // Velocity gain on distance
   double kp_ = 1.2;                      // Heading tracking gain
-  double min_vel_ = 0.05;                // Avoid crawling when path is clear but short
 
   // Heading selection
   double search_fov_ = 100.0 * M_PI / 180.0;  // candidates in +/- 100 deg (ignores robot's own rear posts)
@@ -101,9 +119,9 @@ private:
   int recovery_spin_dir_ = 1;            // +1 CCW, -1 CW
   int recovery_ticks_ = 0;
   int recovery_rotate_timeout_ = 100;    // 10 s
-  double recovery_clear_ = 0.80;         // free distance needed to leave RECOVERY_ROTATE
-  double recovery_start_x_ = 0.0;
-  double recovery_start_y_ = 0.0;
+  double recovery_clear_ = 0.80;         // free distance needed (over a +/-20 deg wedge) to leave RECOVERY_ROTATE
+  double recovery_min_turn_ = 60.0 * M_PI / 180.0;  // always spin at least this far away before leaving
+  double recovery_start_yaw_ = 0.0;
 
   double wrap(double angle) {
     return std::atan2(std::sin(angle), std::cos(angle));
@@ -129,6 +147,13 @@ public:
             rmw_qos_profile_sensor_data),
         std::bind(&Lab3Node::laser_scan_callback, this, _1));
 
+    sub_hazard_ = this->create_subscription<irobot_create_msgs::msg::HazardDetectionVector>(
+        "/TTB06/hazard_detection",
+        rclcpp::QoS(
+            rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
+            rmw_qos_profile_sensor_data),
+        std::bind(&Lab3Node::hazard_callback, this, _1));
+
     pub_twist_ = this->create_publisher<Twist>("/TTB06/cmd_vel", 10);
 
     pos_.x = 0.0;
@@ -148,7 +173,7 @@ private:
   // ---------------------------------------------------------------------------
   double free_distance(double heading) {
     double free = lookahead_;
-    for (const auto &p : obstacles_) {
+    for (const auto &p : world_obstacles_) {
       double rel = wrap(p.angle - heading);
       double forward = p.range * std::cos(rel);
       double lateral = std::abs(p.range * std::sin(rel));
@@ -163,8 +188,70 @@ private:
     pub_twist_->publish(Twist());
   }
 
-  void start_recovery(const char *reason) {
-    // Spin toward the most open direction instead of a random one
+  // Store nearby live lidar points (global frame) so the box we hit stays "solid"
+  // even when it is behind us, outside the FOV, or closer than the lidar's range_min.
+  void remember_obstacles(double radius) {
+    rclcpp::Time now = this->now();
+    for (const auto &p : obstacles_) {
+      if (p.range > radius) {
+        continue;
+      }
+      double gx = pos_.x + p.range * std::cos(current_angle_ + p.angle);
+      double gy = pos_.y + p.range * std::sin(current_angle_ + p.angle);
+
+      bool duplicate = false;
+      for (auto &m : memory_) {
+        if (std::hypot(m.x - gx, m.y - gy) < 0.05) {
+          m.stamp = now;   // refresh
+          duplicate = true;
+          break;
+        }
+      }
+      if (!duplicate) {
+        memory_.push_back({gx, gy, now});
+      }
+    }
+    while (memory_.size() > memory_max_points_) {
+      memory_.erase(memory_.begin());
+    }
+  }
+
+  // Live + remembered obstacles, all expressed in the current body frame
+  void build_world_obstacles() {
+    world_obstacles_ = obstacles_;
+    rclcpp::Time now = this->now();
+    memory_.erase(
+        std::remove_if(memory_.begin(), memory_.end(),
+                       [&](const MemoryPoint &m) { return (now - m.stamp).seconds() > memory_duration_; }),
+        memory_.end());
+
+    double c = std::cos(current_angle_);
+    double s = std::sin(current_angle_);
+    for (const auto &m : memory_) {
+      double dx = m.x - pos_.x;
+      double dy = m.y - pos_.y;
+      double bx = dx * c + dy * s;
+      double by = -dx * s + dy * c;
+      double r = std::hypot(bx, by);
+      if (r < 1e-3 || r > lookahead_) {
+        continue;
+      }
+      world_obstacles_.push_back({std::atan2(by, bx), r});
+    }
+  }
+
+  // Spin AWAY from whatever is close in front: obstacle on the left -> spin CW, on the right -> CCW
+  int away_spin_dir() {
+    double side = 0.0;
+    for (const auto &p : obstacles_) {
+      if (p.range < 1.5 * min_safe_distance_ && std::abs(p.angle) <= 120.0 * M_PI / 180.0) {
+        side += std::sin(p.angle) / p.range;   // closer points weigh more
+      }
+    }
+    if (std::abs(side) > 1e-6) {
+      return (side > 0.0) ? -1 : 1;
+    }
+    // Nothing close in front: fall back to the most open heading
     double best_free = -1.0;
     double best_h = 0.0;
     for (double h = -M_PI; h <= M_PI; h += 10.0 * M_PI / 180.0) {
@@ -174,11 +261,27 @@ private:
         best_h = h;
       }
     }
-    recovery_spin_dir_ = (best_h >= 0.0) ? 1 : -1;
+    return (best_h >= 0.0) ? 1 : -1;
+  }
+
+  void start_recovery(const char *reason, int forced_dir = 0) {
+    remember_obstacles(1.0);   // blacklist the box so the escape path never re-enters its inflated zone
+    recovery_spin_dir_ = (forced_dir != 0) ? forced_dir : away_spin_dir();
+    recovery_start_yaw_ = current_angle_;
     recovery_ticks_ = 0;
     state_ = RobotState::RECOVERY_ROTATE;
-    RCLCPP_WARN(this->get_logger(), "%s Spinning %s toward most open heading.", reason,
+    RCLCPP_WARN(this->get_logger(), "%s Spinning %s away from obstacle.", reason,
                 recovery_spin_dir_ > 0 ? "CCW" : "CW");
+  }
+
+  // Clear enough over the whole forward wedge (+/- 20 deg), not just a single ray
+  bool wedge_is_clear(double clearance) {
+    for (double h = -20.0; h <= 20.0; h += 10.0) {
+      if (free_distance(h * M_PI / 180.0) < clearance) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void command_loop_function() {
@@ -194,6 +297,8 @@ private:
       return;
     }
 
+    build_world_obstacles();
+
     Twist cmd;
     double dist_to_goal = std::hypot(goal_.x - pos_.x, goal_.y - pos_.y);
 
@@ -204,47 +309,47 @@ private:
       return;
     }
 
-    // 2. Recovery State Machine
-    if (state_ == RobotState::RECOVERY_ROTATE) {
-      cmd.linear.x = 0.0;
-      cmd.angular.z = recovery_spin_dir_ * max_ang_vel_;
-      recovery_ticks_++;
+    // 1b. Bumper contact: we already hit it. Stop, remember the box, spin away.
+    if (bump_pending_) {
+      bump_pending_ = false;
+      stop_robot();
+      if (state_ == RobotState::RECOVERY_ROTATE) {
+        remember_obstacles(1.0);   // already spinning: just refresh the box in memory
+      } else {
+        pose_history_.clear();
+        start_recovery("Bumper triggered!", bump_spin_dir_);
+      }
+      return;
+    }
 
-      double forward_clearance = free_distance(0.0);
-      if (forward_clearance >= recovery_clear_) {
-        state_ = RobotState::RECOVERY_FORWARD;
-        recovery_start_x_ = pos_.x;
-        recovery_start_y_ = pos_.y;
-        RCLCPP_INFO(this->get_logger(), "Safe corridor found (%.2fm). Driving forward 0.5m.", forward_clearance);
-      } else if (recovery_ticks_ > recovery_rotate_timeout_) {
-        // Never spin forever: give normal navigation another try
+    // 2. Recovery: spin away from the box (no forced forward drive)
+    if (state_ == RobotState::RECOVERY_ROTATE) {
+      recovery_ticks_++;
+      double turned = std::abs(wrap(current_angle_ - recovery_start_yaw_));
+
+      // Leave only after turning well away AND the whole forward wedge is open
+      // (remembered box included). Navigation then takes over; its speed limit and
+      // tube test keep the disk + safety radius out of the box's keep-out zone.
+      if (turned >= recovery_min_turn_ && wedge_is_clear(recovery_clear_)) {
         state_ = RobotState::NAVIGATING;
         pose_history_.clear();
+        prev_heading_ = 0.0;
+        RCLCPP_INFO(this->get_logger(), "Turned %.0f deg away, wedge clear. Resuming navigation.",
+                    turned * 180.0 / M_PI);
+        stop_robot();
+        return;
+      }
+      if (recovery_ticks_ > recovery_rotate_timeout_) {
+        state_ = RobotState::NAVIGATING;
+        pose_history_.clear();
+        prev_heading_ = 0.0;
         RCLCPP_WARN(this->get_logger(), "Recovery rotate timed out. Resuming navigation.");
         stop_robot();
         return;
       }
 
-      pub_twist_->publish(cmd);
-      return;
-    }
-
-    if (state_ == RobotState::RECOVERY_FORWARD) {
-      cmd.linear.x = 0.20;
-      cmd.angular.z = 0.0;
-
-      double dist_traveled = std::hypot(pos_.x - recovery_start_x_, pos_.y - recovery_start_y_);
-      double forward_clearance = free_distance(0.0);
-
-      if (dist_traveled >= 0.50 || forward_clearance < min_safe_distance_) {
-        state_ = RobotState::NAVIGATING;
-        pose_history_.clear();
-        prev_heading_ = 0.0;
-        RCLCPP_INFO(this->get_logger(), "Recovery escape completed. Resuming navigation.");
-        stop_robot();
-        return;
-      }
-
+      cmd.linear.x = 0.0;
+      cmd.angular.z = recovery_spin_dir_ * max_ang_vel_;
       pub_twist_->publish(cmd);
       return;
     }
@@ -308,15 +413,17 @@ private:
     double heading_error = wrap(desired_heading - current_angle_);
     double steering = kp_ * heading_error;
 
-    // 5. Velocity: kv * distance (lab2), where "distance" is limited by the obstacle straight ahead
+    // 5. Velocity: kv * distance (lab2), limited by the obstacle straight ahead.
+    //    Anything inside the disk + safety radius in the direction of travel => no forward motion.
     double ahead_free = free_distance(0.0);
+    double stop_distance = min_safe_distance_ + brake_margin_;
     double velocity = 0.0;
-    if (ahead_free > min_safe_distance_) {
-      double usable = std::min(dist_to_goal, ahead_free - min_safe_distance_);
-      velocity = std::clamp(kv_ * usable, min_vel_, max_vel_);
+    if (ahead_free > stop_distance) {
+      double usable = std::min(dist_to_goal, ahead_free - stop_distance);
+      velocity = std::clamp(kv_ * usable, 0.0, max_vel_);
       velocity *= std::max(0.0, std::cos(heading_error));  // turn first, drive when aligned
     }
-    // else: obstacle inside safety distance ahead -> rotate in place only
+    // else: rotate in place only
 
     cmd.linear.x = velocity;
     cmd.angular.z = std::clamp(steering, -max_ang_vel_, max_ang_vel_);
@@ -349,6 +456,24 @@ private:
     current_angle_ = wrap(raw_yaw - origin_yaw_);
 
     odom_received_ = true;
+  }
+
+  void hazard_callback(const irobot_create_msgs::msg::HazardDetectionVector &msg) {
+    for (const auto &d : msg.detections) {
+      if (d.type != irobot_create_msgs::msg::HazardDetection::BUMP) {
+        continue;
+      }
+      bump_pending_ = true;
+      // Spin away from the bumper that fired (frame id e.g. bump_left / bump_front_center / bump_right)
+      const std::string &f = d.header.frame_id;
+      if (f.find("left") != std::string::npos) {
+        bump_spin_dir_ = -1;
+      } else if (f.find("right") != std::string::npos) {
+        bump_spin_dir_ = 1;
+      } else {
+        bump_spin_dir_ = 0;   // centre bump: decide from the lidar
+      }
+    }
   }
 
   void laser_scan_callback(const LaserScan &msg) {
