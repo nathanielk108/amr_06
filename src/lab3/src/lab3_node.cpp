@@ -118,10 +118,6 @@ public:
 
 private:
   void command_loop_function() {
-    if (!odom_received_ || !scan_received_) {
-      return;
-    }
-
     Twist cmd;
     double dist_to_goal = std::hypot(goal_.x - pos_.x, goal_.y - pos_.y);
 
