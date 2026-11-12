@@ -55,8 +55,11 @@ private:
   double goal_distance_ = 10.0;      // goal: this far ahead of the start pose (m)
   double goal_margin_ = 0.10;        // lab2 "margin"
   double robot_radius_ = 0.20;       // disk abstraction (m)
-  double safety_buffer_ = 0.10;      // extra clearance (m)
-  double lookahead_ = 2.0;           // distance treated as "fully open" (m)
+  double side_margin_ = 0.03;        // sideways margin on top of the radius for the travel tube (m)
+  double front_buffer_ = 0.10;       // stop/back-off distance beyond the radius, straight ahead (m)
+  double clear_distance_ = 1.0;      // a heading is "open" if this much room is free along it (m)
+  double lookahead_ = 2.0;           // lidar distance considered (m)
+  double lidar_yaw_offset_ = 0.0;    // rad; set if scan angle 0 is NOT the robot's front
 
   // Controller (lab2 style)
   double kv_ = 0.5;                  // velocity gain on distance
@@ -65,12 +68,6 @@ private:
   double max_ang_vel_ = M_PI / 3.0;  // rad/s
   double reverse_vel_ = 0.10;        // m/s, used only when an obstacle is inside the stop distance
 
-  // Heading choice
-  double w_dist_ = 0.55;             // weight: free distance
-  double w_goal_ = 0.45;             // weight: goal alignment
-  double w_prev_ = 0.20;             // weight: stay with previous choice (anti-dither)
-  double prev_heading_ = 0.0;
-
   double wrap(double angle) {
     return std::atan2(std::sin(angle), std::cos(angle));
   }
@@ -78,7 +75,7 @@ private:
 public:
   explicit Lab3Node() : rclcpp::Node("lab3_node") {
     timer_ = this->create_wall_timer(
-        10ms, std::bind(&Lab3Node::command_loop_function, this));
+        100ms, std::bind(&Lab3Node::command_loop_function, this));
 
     sub_odometry_ = this->create_subscription<Odometry>(
         "/TTB06/odom",
@@ -118,21 +115,27 @@ private:
     return free;
   }
 
-  // Heading (body frame) toward the clearest area, biased toward the goal
+  // Heading (body frame) for when the goal direction is blocked: of all headings that are open
+  // (>= clear_distance_ free), take the one closest to the goal direction. If none is open,
+  // take the heading with the most free room.
   double choose_heading(double goal_heading_body, double half_width) {
-    double best_heading = goal_heading_body;
-    double best_score = -1e9;
+    double open_heading = goal_heading_body, open_err = 1e9;
+    double best_heading = goal_heading_body, best_free = -1.0;
 
     for (double h = -M_PI / 2.0; h <= M_PI / 2.0 + 1e-9; h += 5.0 * M_PI / 180.0) {
-      double score = w_dist_ * (free_distance(h, half_width) / lookahead_)
-                   + w_goal_ * std::cos(wrap(h - goal_heading_body))
-                   - w_prev_ * std::abs(wrap(h - prev_heading_)) / M_PI;
-      if (score > best_score) {
-        best_score = score;
+      double free = free_distance(h, half_width);
+      double err = std::abs(wrap(h - goal_heading_body));
+
+      if (free >= clear_distance_ && err < open_err) {
+        open_err = err;
+        open_heading = h;
+      }
+      if (free > best_free + 1e-6) {
+        best_free = free;
         best_heading = h;
       }
     }
-    return best_heading;
+    return (open_err < 1e9) ? open_heading : best_heading;
   }
 
   void command_loop_function() {
@@ -146,8 +149,8 @@ private:
       return;
     }
 
-    double half_width = robot_radius_ + safety_buffer_;   // disk + safety radius
-    double stop_distance = half_width + 0.10;             // must stop/back off inside this
+    double half_width = robot_radius_ + side_margin_;     // travel tube: only what the body would hit
+    double stop_distance = robot_radius_ + front_buffer_; // never drive forward inside this
 
     // --- go_to_goal (lab2) ---
     double distance = std::hypot(goal_.x - pos_.x, goal_.y - pos_.y);
@@ -162,10 +165,9 @@ private:
     // --- obstacle avoidance: steer toward the clearest heading ---
     // If the path to the goal is open, go straight to the goal; otherwise use the clearest heading.
     double heading_error = goal_heading_body;
-    if (free_distance(goal_heading_body, half_width) < std::min(distance, lookahead_)) {
+    if (free_distance(goal_heading_body, half_width) < std::min(distance, clear_distance_)) {
       heading_error = choose_heading(goal_heading_body, half_width);
     }
-    prev_heading_ = heading_error;
     double steering = kp_ * heading_error;
 
     // --- velocity: kv * distance, limited by the free space straight ahead ---
@@ -177,6 +179,11 @@ private:
     } else if (free_distance(M_PI, robot_radius_) > 0.30) {
       velocity = -reverse_vel_;                             // too close: back away while steering
     }                                                       // else: stay still, never drive into it
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "pos(%.2f, %.2f) goal_dist %.2f | goal_hdg %.0f deg, chosen %.0f deg | ahead_free %.2f | v %.2f",
+        pos_.x, pos_.y, distance, goal_heading_body * 180.0 / M_PI, heading_error * 180.0 / M_PI,
+        ahead, velocity);
 
     Twist cmd;
     cmd.linear.x = velocity;
@@ -194,12 +201,18 @@ private:
     double qw = msg.pose.pose.orientation.w;
     double raw_yaw = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
 
-    // First message defines the start frame: goal = goal_distance_ straight ahead of it
+    // First message defines the start frame (+x = start heading). Goal = (goal_distance_, 0) in it,
+    // i.e. exactly goal_distance_ metres straight ahead of the start position.
     if (!origin_set_) {
       origin_x_ = raw_x;
       origin_y_ = raw_y;
       origin_yaw_ = raw_yaw;
       origin_set_ = true;
+      goal_.x = goal_distance_;
+      goal_.y = 0.0;
+      RCLCPP_INFO(this->get_logger(), "Start (%.2f, %.2f, yaw %.0f deg). Goal = %.1f m ahead -> odom (%.2f, %.2f)",
+                  raw_x, raw_y, raw_yaw * 180.0 / M_PI, goal_distance_,
+                  raw_x + goal_distance_ * std::cos(raw_yaw), raw_y + goal_distance_ * std::sin(raw_yaw));
     }
 
     double dx = raw_x - origin_x_;
@@ -223,7 +236,7 @@ private:
       if (std::isnan(r) || std::isinf(r) || r < msg.range_min || r >= msg.range_max) {
         continue;
       }
-      double angle = wrap(msg.angle_min + static_cast<double>(i) * msg.angle_increment);
+      double angle = wrap(msg.angle_min + static_cast<double>(i) * msg.angle_increment + lidar_yaw_offset_);
       obstacles_.push_back({angle, r});
     }
     last_scan_time_ = this->now();
