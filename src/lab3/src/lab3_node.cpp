@@ -1,201 +1,381 @@
-#include <algorithm>
 #include <cmath>
+#include <algorithm>
+#include <chrono>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/qos.hpp>
 #include <rmw/qos_profiles.h>
-#include <sensor_msgs/msg/laser_scan.hpp>
-#include <nav_msgs/msg/odometry.hpp>
+
 #include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+#include <irobot_create_msgs/srv/reset_pose.hpp>
 
 using namespace std::chrono_literals;
 using namespace std::placeholders;
-using namespace sensor_msgs::msg;
-using namespace geometry_msgs::msg;
-using namespace nav_msgs::msg;
 
-static double wrap(double a) { return std::atan2(std::sin(a), std::cos(a)); }
+using geometry_msgs::msg::Twist;
+using geometry_msgs::msg::Vector3;
+using nav_msgs::msg::Odometry;
+using sensor_msgs::msg::LaserScan;
+using irobot_create_msgs::srv::ResetPose;
 
 class Lab3Node : public rclcpp::Node {
 private:
+  // ROS 2 Communication Handles
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
   rclcpp::Subscription<LaserScan>::SharedPtr sub_laser_scan_;
   rclcpp::Publisher<Twist>::SharedPtr pub_twist_;
+  rclcpp::Client<ResetPose>::SharedPtr client_reset_pose_;
 
-  // Pose in the start-relative frame
-  double x_ = 0.0, y_ = 0.0, yaw_ = 0.0;
-  double goal_x_ = 1.5, goal_y_ = 0.0;
-  double goal_tolerance_ = 0.10;
+  // Vehicle State (in start frame)
+  Vector3 pos_{};
+  Vector3 goal_{};
+  double current_angle_ = 0.0;
 
-  double origin_x_ = 0.0, origin_y_ = 0.0, origin_yaw_ = 0.0;
-  bool origin_set_ = false;
+  // Odometry Calibration Flags & Raw Offsets
+  bool odom_received_ = false;
+  bool origin_rendered_ = false;
+  double origin_x_ = 0.0;
+  double origin_y_ = 0.0;
+  double origin_yaw_ = 0.0;
+  rclcpp::Time reset_trigger_time_{0, 0, RCL_ROS_TIME};
 
-  // Scan data (robot frame)
-  std::vector<double> angles_;
-  std::vector<double> clearance_;   // windowed min range per beam
-  double front_clear_ = 0.0;        // min range in the cone dead ahead
-  bool have_scan_ = false;
+  // Laser Scan Storage
+  LaserScan latest_scan_;
+  bool scan_received_ = false;
+  rclcpp::Time last_scan_time_{0, 0, RCL_ROS_TIME};
 
-  // State machine
-  enum class Mode { DRIVE, ROTATE };
-  Mode mode_ = Mode::DRIVE;
-  double turn_dir_ = 0.0;           // committed spin direction (+1 left, -1 right)
+  // Detour Commitment (Hysteresis)
+  double committed_heading_ = 0.0;
+  bool has_committed_detour_ = false;
+  rclcpp::Time detour_commit_time_{0, 0, RCL_ROS_TIME};
 
-  // Tunables
-  double max_range_ = 3.0;
-  double max_vel_ = 0.3;
-  double min_vel_ = 0.08;           // always creep forward while driving
-  double max_ang_vel_ = M_PI / 2;
-  double rot_vel_ = M_PI / 3;       // in-place spin speed
-  double window_half_angle_ = 0.40; // rad, how wide a gap must be (robot width)
-  double front_half_angle_ = 0.35;  // rad, emergency cone
-  double stop_dist_ = 0.35;         // m, enter ROTATE below this
-  double resume_dist_ = 0.60;       // m, front must clear this to leave ROTATE
-  double open_dist_ = 0.80;         // m, clearance needed to be a rotate target
-  double slow_dist_ = 1.00;         // m, start slowing below this
-  double w_goal_ = 1.0, w_clear_ = 1.5, w_prev_ = 0.3;
-  double k_turn_ = 1.5;
-  double prev_angle_ = 0.0;
+  // Configuration Parameters
+  double robot_radius_ = 0.15;
+  double side_margin_ = 0.05;
+  double front_stop_ = 0.35;
+  double clear_distance_ = 1.0;
+  double repel_gain_ = 3.0;
+  double kv_ = 0.5;
+  double kp_ = 1.5;
+  double margin_ = 0.10;
+  double max_vel_ = 0.35;
+  double max_ang_vel_ = 60.0 * M_PI / 180.0; // 60 deg/s in rad/s
+  double lidar_yaw_offset_ = 0.0;
 
-public:
-  Lab3Node() : rclcpp::Node("lab3_node") {
-    timer_ = create_wall_timer(20ms, std::bind(&Lab3Node::command_loop, this));
-
-    auto qos = rclcpp::QoS(
-        rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
-        rmw_qos_profile_sensor_data);
-
-    sub_odometry_ = create_subscription<Odometry>(
-        "/TTB06/odom", qos, std::bind(&Lab3Node::odometry_callback, this, _1));
-    sub_laser_scan_ = create_subscription<LaserScan>(
-        "/TTB06/scan", qos, std::bind(&Lab3Node::laser_scan_callback, this, _1));
-    pub_twist_ = create_publisher<Twist>("/TTB06/cmd_vel", 10);
+  // Helper functions
+  static double wrap(double angle) {
+    return std::atan2(std::sin(angle), std::cos(angle));
   }
 
-  void command_loop() {
-    Twist cmd;  // zeros by default = stop
-    if (!origin_set_ || !have_scan_) { pub_twist_->publish(cmd); return; }
+public:
+  explicit Lab3Node() : rclcpp::Node("lab3_node") {
+    // Parameters
+    robot_radius_ = declare_parameter<double>("robot_radius", 0.15);
+    side_margin_ = declare_parameter<double>("side_margin", 0.05);
+    front_stop_ = declare_parameter<double>("front_stop", 0.35);
+    clear_distance_ = declare_parameter<double>("clear_distance", 1.0);
+    repel_gain_ = declare_parameter<double>("repel_gain", 3.0);
+    kv_ = declare_parameter<double>("kv", 0.5);
+    kp_ = declare_parameter<double>("kp", 1.5);
+    margin_ = declare_parameter<double>("margin", 0.10);
+    max_vel_ = declare_parameter<double>("max_vel", 0.35);
+    max_ang_vel_ = declare_parameter<double>("max_ang_vel", 60.0 * M_PI / 180.0);
+    lidar_yaw_offset_ = declare_parameter<double>("lidar_yaw_offset", 0.0);
 
-    double dist = std::hypot(goal_x_ - x_, goal_y_ - y_);
-    if (dist < goal_tolerance_) { pub_twist_->publish(cmd); return; }
+    // Subscriptions and Publishers
+    sub_odometry_ = create_subscription<Odometry>(
+        "/TTB06/odom",
+        rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data), rmw_qos_profile_sensor_data),
+        std::bind(&Lab3Node::odometry_callback, this, _1));
 
-    // Goal direction relative to the robot (same frame as the laser angles)
-    double goal_rel = wrap(std::atan2(goal_y_ - y_, goal_x_ - x_) - yaw_);
+    sub_laser_scan_ = create_subscription<LaserScan>(
+        "/TTB06/scan",
+        rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data), rmw_qos_profile_sensor_data),
+        std::bind(&Lab3Node::laser_scan_callback, this, _1));
 
-    if (mode_ == Mode::DRIVE && front_clear_ < stop_dist_) {
-      mode_ = Mode::ROTATE;
-      turn_dir_ = 0.0;
+    pub_twist_ = create_publisher<Twist>("/TTB06/cmd_vel", 10);
+    client_reset_pose_ = create_client<ResetPose>("/TTB06/reset_pose");
+
+    // 10 Hz Timer Loop
+    timer_ = create_wall_timer(100ms, std::bind(&Lab3Node::command_loop_function, this));
+
+    // Reset pose asynchronous call
+    reset_trigger_time_ = this->now();
+    reset_robot_pose();
+  }
+
+private:
+  void reset_robot_pose() {
+    if (!client_reset_pose_->wait_for_service(3s)) {
+      RCLCPP_WARN(get_logger(), "ResetPose service unavailable after 3s; using current pose as origin.");
+      return;
     }
 
-    if (mode_ == Mode::ROTATE) {
-      // Target = open direction closest to the goal heading
-      double target = 0.0, best_err = 1e9;
-      bool found = false;
-      for (size_t i = 0; i < angles_.size(); ++i) {
-        if (clearance_[i] < open_dist_) continue;
-        double err = std::fabs(wrap(angles_[i] - goal_rel));
-        if (err < best_err) { best_err = err; target = angles_[i]; found = true; }
-      }
-      if (!found) {  // boxed in: spin toward the most open direction
-        double best_clear = -1.0;
-        for (size_t i = 0; i < angles_.size(); ++i)
-          if (clearance_[i] > best_clear) { best_clear = clearance_[i]; target = angles_[i]; }
-      }
+    auto req = std::make_shared<ResetPose::Request>();
+    req->pose.position.x = 0.0;
+    req->pose.position.y = 0.0;
+    req->pose.position.z = 0.0;
+    req->pose.orientation.x = 0.0;
+    req->pose.orientation.y = 0.0;
+    req->pose.orientation.z = 0.0;
+    req->pose.orientation.w = 1.0;
 
-      // Commit to a spin direction when the target is nearly behind us
-      double w;
-      if (std::fabs(target) > 2.6) {
-        if (turn_dir_ == 0.0) turn_dir_ = (target >= 0.0) ? 1.0 : -1.0;
-        w = turn_dir_ * rot_vel_;
-      } else {
-        turn_dir_ = 0.0;
-        w = std::clamp(k_turn_ * target, -rot_vel_, rot_vel_);
-      }
+    client_reset_pose_->async_send_request(
+        req, std::bind(&Lab3Node::reset_pose_response_callback, this, _1));
+  }
 
-      if (front_clear_ > resume_dist_ && std::fabs(target) < 0.35) {
-        mode_ = Mode::DRIVE;  // facing open space toward the goal: go
-      } else {
-        cmd.angular.z = w;    // linear stays 0
-        pub_twist_->publish(cmd);
-        return;
-      }
+  void reset_pose_response_callback(rclcpp::ClientGoalHandle<ResetPose>::SharedFuture future) {
+    try {
+      (void)future.get();
+      RCLCPP_INFO(get_logger(), "Successfully called /TTB06/reset_pose.");
+    } catch (const std::exception &e) {
+      RCLCPP_WARN(get_logger(), "ResetPose service call failed: %s", e.what());
     }
-
-    // DRIVE: goal-weighted direction choice, always moving forward
-    double best_cost = 1e9, best_angle = 0.0;
-    for (size_t i = 0; i < angles_.size(); ++i) {
-      double a = angles_[i];
-      double cost = w_goal_ * std::fabs(wrap(a - goal_rel))
-                  + w_clear_ * (max_range_ - clearance_[i]) / max_range_ * M_PI
-                  + w_prev_ * std::fabs(wrap(a - prev_angle_));
-      if (cost < best_cost) { best_cost = cost; best_angle = a; }
-    }
-    prev_angle_ = best_angle;
-
-    double w = std::clamp(k_turn_ * best_angle, -max_ang_vel_, max_ang_vel_);
-    double speed_scale = std::clamp(
-        (front_clear_ - stop_dist_) / (slow_dist_ - stop_dist_), 0.0, 1.0);
-    double align = std::max(0.3, std::cos(best_angle));  // floor so it never stalls
-    double v = std::max(min_vel_, max_vel_ * speed_scale * align);
-    v = std::min(v, dist);  // don't overshoot the goal
-
-    cmd.linear.x = v;
-    cmd.angular.z = w;
-    pub_twist_->publish(cmd);
   }
 
   void odometry_callback(const Odometry &msg) {
-    double px = msg.pose.pose.position.x;
-    double py = msg.pose.pose.position.y;
-    const auto &q = msg.pose.pose.orientation;
-    double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
-                            1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
+    const double trig_time = reset_trigger_time_.seconds();
 
-    if (!origin_set_) {
-      origin_x_ = px; origin_y_ = py; origin_yaw_ = yaw;
-      origin_set_ = true;
+    // Skip stale pre-reset odometry messages (up to ~1s post request)
+    if (!origin_rendered_ && (stamp - trig_time < 0.8)) {
+      return;
     }
-    double dx = px - origin_x_, dy = py - origin_y_;
-    x_ =  dx * std::cos(origin_yaw_) + dy * std::sin(origin_yaw_);
-    y_ = -dx * std::sin(origin_yaw_) + dy * std::cos(origin_yaw_);
-    yaw_ = wrap(yaw - origin_yaw_);
+
+    double raw_x = msg.pose.pose.position.x;
+    double raw_y = msg.pose.pose.position.y;
+
+    double qx = msg.pose.pose.orientation.x;
+    double qy = msg.pose.pose.orientation.y;
+    double qz = msg.pose.pose.orientation.z;
+    double qw = msg.pose.pose.orientation.w;
+    double raw_yaw = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
+
+    if (!origin_rendered_) {
+      origin_x_ = raw_x;
+      origin_y_ = raw_y;
+      origin_yaw_ = raw_yaw;
+      origin_rendered_ = true;
+
+      // Goal set to (10.0, 0.0) in the verified start frame
+      goal_.x = 10.0;
+      goal_.y = 0.0;
+
+      RCLCPP_INFO(get_logger(), "Start odom (%.2f, %.2f, %.2f). Goal = odom (%.2f, %.2f)",
+                  0.0, 0.0, 0.0, goal_.x, goal_.y);
+    }
+
+    double dx = raw_x - origin_x_;
+    double dy = raw_y - origin_y_;
+    pos_.x = dx * std::cos(origin_yaw_) + dy * std::sin(origin_yaw_);
+    pos_.y = -dx * std::sin(origin_yaw_) + dy * std::cos(origin_yaw_);
+    current_angle_ = wrap(raw_yaw - origin_yaw_);
+
+    odom_received_ = true;
   }
 
   void laser_scan_callback(const LaserScan &msg) {
-    const size_t n = msg.ranges.size();
-    if (n == 0) return;
+    latest_scan_ = msg;
+    scan_received_ = true;
+    last_scan_time_ = this->now();
+  }
 
-    std::vector<double> r(n);
-    std::vector<double> ang(n);
-    for (size_t i = 0; i < n; ++i) {
-      double range = msg.ranges[i];
-      // inf = no return (free); nan/below range_min = invalid, treat as free
-      if (!std::isfinite(range) || range < msg.range_min) range = max_range_;
-      r[i] = std::min<double>(range, max_range_);
-      ang[i] = wrap(msg.angle_min + msg.angle_increment * i);
+  // Pure functions for LIDAR calculations
+  double free_distance(double heading_body, double half_width) const {
+    if (!scan_received_ || latest_scan_.ranges.empty()) {
+      return 0.0;
     }
 
-    // Windowed min: a direction is only "open" if the robot fits through it
-    std::vector<double> clr(n, max_range_);
-    double front = max_range_;
-    for (size_t i = 0; i < n; ++i) {
-      double m = max_range_;
-      for (size_t j = 0; j < n; ++j) {
-        if (std::fabs(wrap(ang[j] - ang[i])) <= window_half_angle_)
-          m = std::min(m, r[j]);
+    double max_lookahead = 2.0;
+    double min_free = max_lookahead;
+
+    for (size_t i = 0; i < latest_scan_.ranges.size(); ++i) {
+      double r = latest_scan_.ranges[i];
+      if (std::isnan(r) || r < latest_scan_.range_min) {
+        continue; // Drop invalid readings
       }
-      clr[i] = m;
-      if (std::fabs(ang[i]) <= front_half_angle_)
-        front = std::min(front, r[i]);
+
+      // inf or range >= range_max represents open space
+      if (std::isinf(r) || r >= latest_scan_.range_max) {
+        continue;
+      }
+
+      double raw_angle = latest_scan_.angle_min + static_cast<double>(i) * latest_scan_.angle_increment;
+      double angle = wrap(raw_angle + lidar_yaw_offset_);
+
+      double forward = r * std::cos(angle - heading_body);
+      double lateral = std::abs(r * std::sin(angle - heading_body));
+
+      // 0.05m threshold prevents side walls (forward ~ 0) from triggering blockages
+      if (forward > 0.05 && lateral < half_width) {
+        if (forward < min_free) {
+          min_free = forward;
+        }
+      }
+    }
+    return min_free;
+  }
+
+  double compute_side_repulsion() const {
+    if (!scan_received_ || latest_scan_.ranges.empty()) {
+      return 0.0;
     }
 
-    angles_ = std::move(ang);
-    clearance_ = std::move(clr);
-    front_clear_ = front;
-    have_scan_ = true;
+    double repulsion = 0.0;
+    const double influence = 0.6;
+    const double max_angle_rad = 110.0 * M_PI / 180.0;
+
+    for (size_t i = 0; i < latest_scan_.ranges.size(); ++i) {
+      double r = latest_scan_.ranges[i];
+      if (std::isnan(r) || std::isinf(r) || r < latest_scan_.range_min || r >= latest_scan_.range_max) {
+        continue;
+      }
+
+      double raw_angle = latest_scan_.angle_min + static_cast<double>(i) * latest_scan_.angle_increment;
+      double angle = wrap(raw_angle + lidar_yaw_offset_);
+
+      if (r <= influence && std::abs(angle) <= max_angle_rad) {
+        double w = (influence - r) / influence;
+        // Point on right (angle < 0) pushes left (positive repulsion)
+        repulsion += -std::sin(angle) * (w * w) * latest_scan_.angle_increment * repel_gain_;
+      }
+    }
+    return repulsion;
+  }
+
+  bool is_lidar_dead() const {
+    if (!scan_received_) return true;
+    if ((this->now() - last_scan_time_).seconds() > 0.5) return true;
+
+    size_t valid_rays = 0;
+    for (double r : latest_scan_.ranges) {
+      if (!std::isnan(r)) {
+        valid_rays++;
+      }
+    }
+    return (valid_rays == 0);
+  }
+
+  double choose_heading(double goal_heading_body, double dist_to_goal, double half_width) {
+    double goal_free = free_distance(goal_heading_body, half_width);
+    double target_clearance = std::min(dist_to_goal, clear_distance_);
+
+    if (goal_free >= target_clearance) {
+      has_committed_detour_ = false;
+      return goal_heading_body;
+    }
+
+    // Check if committed detour remains valid (held >= 1.5s)
+    if (has_committed_detour_) {
+      double committed_body = wrap(committed_heading_ - current_angle_);
+      if (free_distance(committed_body, half_width) >= clear_distance_) {
+        return committed_body;
+      }
+      // Lost clearance; reset commitment
+      has_committed_detour_ = false;
+    }
+
+    // Sweep +/- 90 degrees in 5-degree steps
+    double best_heading = 0.0;
+    double min_goal_diff = std::numeric_limits<double>::infinity();
+    double max_open_dist = -1.0;
+    bool found_clear_candidate = false;
+
+    for (int deg = -90; deg <= 90; deg += 5) {
+      double sweep_angle = wrap(goal_heading_body + (deg * M_PI / 180.0));
+      double free_dist = free_distance(sweep_angle, half_width);
+
+      if (free_dist >= clear_distance_) {
+        found_clear_candidate = true;
+        double diff = std::abs(wrap(sweep_angle - goal_heading_body));
+        if (diff < min_goal_diff) {
+          min_goal_diff = diff;
+          best_heading = sweep_angle;
+        }
+      } else if (!found_clear_candidate) {
+        if (free_dist > max_open_dist) {
+          max_open_dist = free_dist;
+          best_heading = sweep_angle;
+        }
+      }
+    }
+
+    // Commit to chosen detour angle in global frame
+    committed_heading_ = wrap(best_heading + current_angle_);
+    has_committed_detour_ = true;
+    detour_commit_time_ = this->now();
+
+    return best_heading;
+  }
+
+  void command_loop_function() {
+    if (!odom_received_) {
+      return;
+    }
+
+    Twist cmd{};
+
+    // Handle dead LIDAR safety
+    if (is_lidar_dead()) {
+      pub_twist_->publish(cmd);
+      return;
+    }
+
+    // Goal distance and heading calculations
+    double dist = std::hypot(goal_.x - pos_.x, goal_.y - pos_.y);
+    if (dist < margin_) {
+      pub_twist_->publish(cmd);
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "Goal reached successfully!");
+      return;
+    }
+
+    double goal_heading_global = std::atan2(goal_.y - pos_.y, goal_.x - pos_.x);
+    double goal_heading_body = wrap(goal_heading_global - current_angle_);
+
+    double half_width = robot_radius_ + side_margin_; // 0.20 m
+    double desired_heading_body = choose_heading(goal_heading_body, dist, half_width);
+
+    // Compute steering with side repulsion
+    double repulsion = compute_side_repulsion();
+    double raw_steering = (kp_ * desired_heading_body) + repulsion;
+    double steering = std::clamp(raw_steering, -max_ang_vel_, max_ang_vel_);
+
+    // Compute velocity over driven arc
+    double free_straight = free_distance(0.0, half_width);
+    double free_mid = free_distance(0.5 * desired_heading_body, half_width);
+    double free_desired = free_distance(desired_heading_body, half_width);
+
+    double path_free = std::min({free_straight, free_mid, free_desired});
+    double velocity = 0.0;
+
+    if (path_free > front_stop_) {
+      double target_v = kv_ * std::min(dist, path_free - front_stop_);
+      velocity = std::clamp(target_v, 0.0, max_vel_);
+      velocity *= std::max(0.2, std::cos(desired_heading_body));
+    } else if (free_distance(M_PI, half_width) > 0.30) {
+      // Slow reverse if forward blocked and rear is clear
+      velocity = -0.10;
+    } else {
+      velocity = 0.0;
+    }
+
+    cmd.linear.x = velocity;
+    cmd.angular.z = steering;
+    pub_twist_->publish(cmd);
+
+    // Log telemetry at 1 Hz
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Pos:(%.2f,%.2f) GoalDist:%.2fm GoalHead:%.2f rad DesHead:%.2f rad PathFree:%.2fm Repel:%.2f V:%.2fm/s",
+        pos_.x, pos_.y, dist, goal_heading_body, desired_heading_body, path_free, repulsion, velocity);
   }
 };
 
