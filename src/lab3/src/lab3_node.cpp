@@ -44,7 +44,7 @@ private:
   bool origin_rendered_ = false;
   double origin_x_ = 0.0;
   double origin_y_ = 0.0;
-  double origin_yaw_ = 0.0;
+  double origin_yaw_ = -90.0;
   rclcpp::Time reset_trigger_time_{0, 0, RCL_ROS_TIME};
 
   // Laser Scan Storage
