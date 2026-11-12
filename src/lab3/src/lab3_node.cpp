@@ -204,3 +204,5 @@ int main(int argc, char **argv) {
   auto node = std::make_shared<Lab3Node>();
   rclcpp::spin(node);
   rclcpp::shutdown();
+  return 0;
+}
